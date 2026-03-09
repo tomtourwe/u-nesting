@@ -18,7 +18,7 @@ use u_nesting_core::{Placement, Result, SolveResult};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use u_nesting_core::timing::Timer;
 
 /// Best fit candidate for 3D placement.
 /// (orientation_idx, width, depth, height, place_x, place_y, place_z, new_row_depth, new_layer_height)
@@ -116,7 +116,7 @@ impl Packer3D {
         geometries: &[Geometry3D],
         boundary: &Boundary3D,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
 
@@ -142,17 +142,16 @@ impl Packer3D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     return Ok(result);
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_volume / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     return Ok(result);
                 }
@@ -278,7 +277,7 @@ impl Packer3D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_volume / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         Ok(result)
     }
@@ -370,7 +369,7 @@ impl Packer3D {
         geometries: &[Geometry3D],
         boundary: &Boundary3D,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
 
         let (ep_placements, utilization) = run_ep_packing(
             geometries,
@@ -412,7 +411,7 @@ impl Packer3D {
         result.boundaries_used = 1;
         result.utilization = utilization;
         result.unplaced = unplaced;
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
         result.strategy = Some("ExtremePoint".to_string());
 
         Ok(result)
@@ -425,7 +424,7 @@ impl Packer3D {
         boundary: &Boundary3D,
         callback: &ProgressCallback,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
 
@@ -462,7 +461,7 @@ impl Packer3D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     callback(
                         ProgressInfo::new()
                             .with_phase("Cancelled")
@@ -474,12 +473,11 @@ impl Packer3D {
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_volume / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     callback(
                         ProgressInfo::new()
@@ -601,7 +599,7 @@ impl Packer3D {
                             .with_phase("Layer Packing")
                             .with_items(placed_count, total_pieces)
                             .with_utilization(total_placed_volume / boundary.measure())
-                            .with_elapsed(start.elapsed().as_millis() as u64),
+                            .with_elapsed(start.elapsed_ms()),
                     );
                 } else {
                     result.unplaced.push(geom.id().clone());
@@ -612,7 +610,7 @@ impl Packer3D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_volume / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         // Final progress callback
         callback(

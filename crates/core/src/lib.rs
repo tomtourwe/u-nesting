@@ -61,6 +61,7 @@ pub mod result;
 pub mod robust;
 pub mod sa;
 pub mod solver;
+pub mod timing;
 pub mod transform;
 
 // Re-exports

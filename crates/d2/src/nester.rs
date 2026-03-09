@@ -32,7 +32,7 @@ use u_nesting_core::{Placement, Result, SolveResult};
 use crate::placement_utils::{expand_nfp, shrink_ifp};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use u_nesting_core::timing::Timer;
 
 /// 2D nesting solver.
 pub struct Nester2D {
@@ -63,7 +63,7 @@ impl Nester2D {
         geometries: &[Geometry2D],
         boundary: &Boundary2D,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
 
@@ -100,17 +100,16 @@ impl Nester2D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     return Ok(result);
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_area / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     return Ok(result);
                 }
@@ -227,7 +226,7 @@ impl Nester2D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_area / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         Ok(result)
     }
@@ -241,7 +240,7 @@ impl Nester2D {
         geometries: &[Geometry2D],
         boundary: &Boundary2D,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
         let mut placed_geometries: Vec<PlacedGeometry> = Vec::new();
@@ -270,17 +269,16 @@ impl Nester2D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     return Ok(result);
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_area / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     return Ok(result);
                 }
@@ -394,7 +392,7 @@ impl Nester2D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_area / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         Ok(result)
     }
@@ -669,7 +667,7 @@ impl Nester2D {
         boundary: &Boundary2D,
         callback: &ProgressCallback,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
 
@@ -715,7 +713,7 @@ impl Nester2D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     callback(
                         ProgressInfo::new()
                             .with_phase("Cancelled")
@@ -727,12 +725,11 @@ impl Nester2D {
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_area / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     callback(
                         ProgressInfo::new()
@@ -832,7 +829,7 @@ impl Nester2D {
                                 .with_phase("BLF Placement")
                                 .with_items(placed_count, total_pieces)
                                 .with_utilization(total_placed_area / boundary.measure())
-                                .with_elapsed(start.elapsed().as_millis() as u64),
+                                .with_elapsed(start.elapsed_ms()),
                         );
                     } else {
                         result.unplaced.push(geom.id().clone());
@@ -846,7 +843,7 @@ impl Nester2D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_area / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         // Final progress callback
         callback(
@@ -868,7 +865,7 @@ impl Nester2D {
         boundary: &Boundary2D,
         callback: &ProgressCallback,
     ) -> Result<SolveResult<f64>> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut result = SolveResult::new();
         let mut placements = Vec::new();
         let mut placed_geometries: Vec<PlacedGeometry> = Vec::new();
@@ -904,7 +901,7 @@ impl Nester2D {
 
             for instance in 0..geom.quantity() {
                 if self.cancelled.load(Ordering::Relaxed) {
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     callback(
                         ProgressInfo::new()
                             .with_phase("Cancelled")
@@ -916,12 +913,11 @@ impl Nester2D {
                 }
 
                 // Check time limit (0 = unlimited)
-                if self.config.time_limit_ms > 0
-                    && start.elapsed().as_millis() as u64 >= self.config.time_limit_ms
+                if self.config.time_limit_ms > 0 && start.elapsed_ms() >= self.config.time_limit_ms
                 {
                     result.boundaries_used = if placements.is_empty() { 0 } else { 1 };
                     result.utilization = total_placed_area / boundary.measure();
-                    result.computation_time_ms = start.elapsed().as_millis() as u64;
+                    result.computation_time_ms = start.elapsed_ms();
                     result.placements = placements;
                     callback(
                         ProgressInfo::new()
@@ -1024,7 +1020,7 @@ impl Nester2D {
                                 .with_phase("NFP Placement")
                                 .with_items(placed_count, total_pieces)
                                 .with_utilization(total_placed_area / boundary.measure())
-                                .with_elapsed(start.elapsed().as_millis() as u64),
+                                .with_elapsed(start.elapsed_ms()),
                         );
                     } else {
                         result.unplaced.push(geom.id().clone());
@@ -1038,7 +1034,7 @@ impl Nester2D {
         result.placements = placements;
         result.boundaries_used = 1;
         result.utilization = total_placed_area / boundary.measure();
-        result.computation_time_ms = start.elapsed().as_millis() as u64;
+        result.computation_time_ms = start.elapsed_ms();
 
         // Final progress callback
         callback(

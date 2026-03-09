@@ -21,7 +21,9 @@ use rand::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::timing::Timer;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -282,7 +284,7 @@ impl<P: SaProblem> SaRunner<P> {
 
     /// Runs the Simulated Annealing algorithm with a specific RNG.
     pub fn run_with_rng<R: Rng>(&self, rng: &mut R) -> SaResult<P::Solution> {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut history = Vec::new();
 
         // Initialize

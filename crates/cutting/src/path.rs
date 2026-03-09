@@ -3,7 +3,7 @@
 //! Combines contour extraction, hierarchy analysis, sequence optimization,
 //! and pierce point selection into a complete cutting path.
 
-use std::time::Instant;
+use u_nesting_core::timing::Timer;
 
 use u_nesting_core::geometry::{Geometry, Geometry2DExt};
 use u_nesting_core::SolveResult;
@@ -61,7 +61,7 @@ pub fn optimize_cutting_path<G>(
 where
     G: Geometry2DExt<Scalar = f64> + Geometry<Scalar = f64>,
 {
-    let start = Instant::now();
+    let start = Timer::now();
 
     // Step 1: Extract contours
     let raw_contours = extract_contours(solve_result, geometries);
@@ -159,7 +159,7 @@ where
         }
     }
 
-    result.computation_time_ms = start.elapsed().as_millis() as u64;
+    result.computation_time_ms = start.elapsed_ms();
 
     // Estimate time if speeds are configured
     if config.rapid_speed > 0.0 && config.cut_speed > 0.0 {

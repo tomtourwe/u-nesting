@@ -339,15 +339,18 @@ pub fn run_ga_packing(
 
     let runner = GaRunner::new(ga_config, problem);
 
-    // Connect cancellation
-    let cancel_handle = runner.cancel_handle();
-    let cancelled_clone = cancelled.clone();
-    std::thread::spawn(move || {
-        while !cancelled_clone.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        cancel_handle.store(true, Ordering::Relaxed);
-    });
+    // Connect cancellation (thread-based polling, not available on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let cancel_handle = runner.cancel_handle();
+        let cancelled_clone = cancelled.clone();
+        std::thread::spawn(move || {
+            while !cancelled_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            cancel_handle.store(true, Ordering::Relaxed);
+        });
+    }
 
     let ga_result = runner.run();
 

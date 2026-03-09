@@ -39,8 +39,8 @@
 //! let result = runner.run(&mut problem, progress_callback);
 //! ```
 
+use crate::timing::Timer;
 use std::fmt::Debug;
-use std::time::Instant;
 
 /// Configuration for the ALNS algorithm.
 #[derive(Debug, Clone)]
@@ -374,7 +374,7 @@ impl AlnsRunner {
             None => rand::rngs::StdRng::from_os_rng(),
         };
 
-        let start_time = Instant::now();
+        let start_time = Timer::now();
 
         // Create initial solution
         let mut current = problem.create_initial_solution();
@@ -537,7 +537,7 @@ impl AlnsRunner {
             iteration += 1;
         }
 
-        let elapsed_ms = start_time.elapsed().as_millis() as u64;
+        let elapsed_ms = start_time.elapsed_ms();
 
         AlnsResult {
             best_solution: best,

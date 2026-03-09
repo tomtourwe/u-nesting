@@ -21,7 +21,9 @@ use rand::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::timing::Timer;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -265,7 +267,7 @@ where
     where
         F: Fn(GaProgress<<P::Individual as Individual>::Fitness>),
     {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut history = Vec::new();
 
         // Initialize population

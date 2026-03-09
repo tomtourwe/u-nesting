@@ -29,7 +29,9 @@ use rand::prelude::*;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::timing::Timer;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -359,7 +361,7 @@ impl<P: BrkgaProblem> BrkgaRunner<P> {
     where
         F: Fn(BrkgaProgress),
     {
-        let start = Instant::now();
+        let start = Timer::now();
         let mut history = Vec::new();
         let num_keys = self.problem.num_keys();
 
