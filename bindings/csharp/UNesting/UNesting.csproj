@@ -28,7 +28,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="../README.md" Pack="true" PackagePath="\" />
 
     <!-- MSBuild .targets for auto-copy of native library -->
     <None Include="build\UNesting.targets" Pack="true" PackagePath="build\" />
