@@ -397,8 +397,85 @@ impl Nester2D {
         Ok(result)
     }
 
+    /// Places a single geometry onto the board given already-placed geometries.
+    ///
+    /// Returns `Some((x, y, rotation_rad))` for the best valid placement, or
+    /// `None` if the geometry cannot be placed.
+    pub fn place_one_part(
+        &self,
+        geom: &Geometry2D,
+        placed: &[PlacedGeometry],
+        boundary: &Boundary2D,
+        sample_step: f64,
+    ) -> Result<Option<(f64, f64, f64)>> {
+        let margin = self.config.margin;
+        let spacing = self.config.spacing;
+        let boundary_polygon = self.get_boundary_polygon_with_margin(boundary, margin);
+
+        let rotations = geom.rotations();
+        let rotation_angles: Vec<f64> = if rotations.is_empty() {
+            vec![0.0]
+        } else {
+            rotations
+        };
+
+        let mut best_placement: Option<(f64, f64, f64)> = None;
+
+        for &rotation in &rotation_angles {
+            let ifp = match compute_ifp_with_margin(&boundary_polygon, geom, rotation, margin) {
+                Ok(ifp) => ifp,
+                Err(_) => continue,
+            };
+            if ifp.is_empty() {
+                continue;
+            }
+
+            let mut nfps: Vec<Nfp> = Vec::new();
+            for p in placed {
+                let cache_key = (
+                    p.geometry.id().as_str(),
+                    geom.id().as_str(),
+                    rotation - p.rotation,
+                );
+                let nfp_at_origin = match self.nfp_cache.get_or_compute(cache_key, || {
+                    compute_nfp(&p.geometry, geom, rotation - p.rotation)
+                }) {
+                    Ok(nfp) => nfp,
+                    Err(_) => continue,
+                };
+                let rotated = rotate_nfp(&nfp_at_origin, p.rotation);
+                let translated = translate_nfp(&rotated, p.position);
+                nfps.push(self.expand_nfp(&translated, spacing));
+            }
+
+            let ifp_shrunk = self.shrink_ifp(&ifp, spacing);
+            let nfp_refs: Vec<&Nfp> = nfps.iter().collect();
+            if let Some((x, y)) = find_bottom_left_placement(&ifp_shrunk, &nfp_refs, sample_step) {
+                let is_better = match best_placement {
+                    None => true,
+                    Some((bx, by, _)) => x < bx - 1e-6 || (x < bx + 1e-6 && y < by - 1e-6),
+                };
+                if is_better {
+                    best_placement = Some((x, y, rotation));
+                }
+            }
+        }
+
+        if let Some((x, y, rotation)) = best_placement {
+            let geom_aabb = geom.aabb_at_rotation(rotation);
+            let boundary_aabb = boundary.aabb();
+            if let Some((cx, cy)) =
+                clamp_placement_to_boundary_with_margin(x, y, geom_aabb, boundary_aabb, margin)
+            {
+                return Ok(Some((cx, cy, rotation)));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Gets the boundary polygon with margin applied.
-    fn get_boundary_polygon_with_margin(
+    pub(crate) fn get_boundary_polygon_with_margin(
         &self,
         boundary: &Boundary2D,
         margin: f64,
@@ -415,7 +492,7 @@ impl Nester2D {
     }
 
     /// Computes an adaptive sample step based on geometry sizes.
-    fn compute_sample_step(&self, geometries: &[Geometry2D]) -> f64 {
+    pub(crate) fn compute_sample_step(&self, geometries: &[Geometry2D]) -> f64 {
         if geometries.is_empty() {
             return 1.0;
         }

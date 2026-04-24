@@ -1,0 +1,36 @@
+[package]
+name = "u-geometry"
+version = "0.1.0"
+edition = "2021"
+authors = ["iyulab"]
+license = "MIT"
+repository = "https://github.com/iyulab/u-geometry"
+description = "Domain-agnostic computational geometry: primitives, polygons, NFP, collision detection, spatial indexing."
+readme = "README.md"
+keywords = ["geometry", "polygon", "computational-geometry", "nfp"]
+categories = ["algorithms", "mathematics"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nalgebra = "0.33"
+robust = "1.1"
+serde = { version = "1.0", features = ["derive"], optional = true }
+wasm-bindgen = { version = "0.2", optional = true }
+serde-wasm-bindgen = { version = "0.6", optional = true }
+
+[dev-dependencies]
+approx = "0.5"
+proptest = "1.5"
+serde_json = "1.0"
+criterion = "0.5"
+
+[[bench]]
+name = "geometry_bench"
+harness = false
+
+[features]
+default = []
+serde = ["dep:serde", "nalgebra/serde-serialize"]
+wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "serde"]

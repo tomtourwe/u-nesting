@@ -37,6 +37,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use u_nesting_core::geometry::Geometry;
 use u_nesting_core::solver::{Config, Solver, Strategy};
 use u_nesting_d2::{Boundary2D, Geometry2D, Nester2D};
 use u_nesting_d3::{Boundary3D, Geometry3D, Packer3D};
@@ -469,6 +470,310 @@ fn available_strategies() -> Vec<&'static str> {
     vec!["blf", "nfp", "ga", "brkga", "sa", "ep"]
 }
 
+// ── Board2D ──────────────────────────────────────────────────────────────────
+
+/// Stateful 2D nesting board for incremental placement.
+///
+/// Typical RL rollout:
+///
+///     board = u_nesting.Board2D(
+///         boundary={"width": 100.0, "height": 100.0},
+///         geometries=[{"id": "A000", "polygon": [...], "rotations": [0.0]}, ...],
+///     )
+///     board.reset()
+///     for part_id in agent_ordering:
+///         result = board.place(part_id)   # None → doesn't fit
+///         if result is None:
+///             break
+///     reward = board.utilization()
+#[pyclass]
+struct Board2D {
+    inner: u_nesting_d2::board::Board2D,
+}
+
+#[pymethods]
+impl Board2D {
+    /// Create a new board.
+    ///
+    /// Args:
+    ///     boundary: dict with ``width``/``height`` or ``polygon``
+    ///     geometries: list of geometry dicts (same format as ``solve_2d``)
+    ///     config: optional config dict (same format as ``solve_2d``)
+    #[new]
+    #[pyo3(signature = (boundary, geometries, config=None))]
+    fn new(
+        py: Python<'_>,
+        boundary: &Bound<'_, PyAny>,
+        geometries: &Bound<'_, PyAny>,
+        config: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        // Parse boundary
+        let boundary_json: String = py
+            .import("json")?
+            .call_method1("dumps", (boundary,))?
+            .extract()?;
+        let boundary_input: Boundary2DInput = serde_json::from_str(&boundary_json)
+            .map_err(|e| PyValueError::new_err(format!("Invalid boundary: {}", e)))?;
+        let rust_boundary =
+            if let (Some(w), Some(h)) = (boundary_input.width, boundary_input.height) {
+                u_nesting_d2::Boundary2D::rectangle(w, h)
+            } else if let Some(polygon) = boundary_input.polygon {
+                let verts: Vec<(f64, f64)> =
+                    polygon.into_iter().map(|p| (p[0], p[1])).collect();
+                u_nesting_d2::Boundary2D::new(verts)
+            } else {
+                return Err(PyValueError::new_err(
+                    "Boundary must have width/height or polygon",
+                ));
+            };
+
+        // Parse geometries
+        let geom_json: String = py
+            .import("json")?
+            .call_method1("dumps", (geometries,))?
+            .extract()?;
+        let geom_inputs: Vec<Geometry2DInput> = serde_json::from_str(&geom_json)
+            .map_err(|e| PyValueError::new_err(format!("Invalid geometries: {}", e)))?;
+        let rust_geometries: Vec<u_nesting_d2::Geometry2D> = geom_inputs
+            .into_iter()
+            .map(|g| {
+                let vertices: Vec<(f64, f64)> =
+                    g.polygon.into_iter().map(|p| (p[0], p[1])).collect();
+                let mut geom = u_nesting_d2::Geometry2D::new(&g.id)
+                    .with_polygon(vertices)
+                    .with_quantity(g.quantity)
+                    .with_flip(g.allow_flip);
+                if let Some(rotations) = g.rotations {
+                    geom = geom.with_rotations_deg(rotations);
+                }
+                if let Some(holes) = g.holes {
+                    for hole in holes {
+                        let hv: Vec<(f64, f64)> =
+                            hole.into_iter().map(|p| (p[0], p[1])).collect();
+                        geom = geom.with_hole(hv);
+                    }
+                }
+                geom
+            })
+            .collect();
+
+        // Parse config
+        let config_input: Option<ConfigInput> = if let Some(cfg) = config {
+            let cfg_json: String = py
+                .import("json")?
+                .call_method1("dumps", (cfg,))?
+                .extract()?;
+            Some(
+                serde_json::from_str(&cfg_json)
+                    .map_err(|e| PyValueError::new_err(format!("Invalid config: {}", e)))?,
+            )
+        } else {
+            None
+        };
+        let rust_config = build_config(config_input);
+
+        Ok(Self {
+            inner: u_nesting_d2::board::Board2D::new(
+                rust_boundary,
+                &rust_geometries,
+                rust_config,
+            ),
+        })
+    }
+
+    /// Place the geometry with the given id onto the board.
+    ///
+    /// Returns a dict ``{"geometry_id", "position": [x, y], "rotation": r}``
+    /// if placed, or ``None`` if the part doesn't fit.
+    fn place(&mut self, py: Python<'_>, geometry_id: &str) -> PyResult<PyObject> {
+        match self
+            .inner
+            .place(geometry_id)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+        {
+            Some(info) => {
+                let d = serde_json::json!({
+                    "geometry_id": info.geometry_id,
+                    "position": [info.x, info.y],
+                    "rotation": info.rotation,
+                });
+                let json_str = serde_json::to_string(&d)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let result = py.import("json")?.call_method1("loads", (json_str,))?;
+                Ok(result.into())
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Remove the last placed geometry. Returns True if something was removed.
+    fn undo(&mut self) -> bool {
+        self.inner.undo()
+    }
+
+    /// Remove all placed geometries.
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    /// Return a lightweight snapshot of the current board state.
+    ///
+    /// The snapshot is a list of dicts: ``[{"id", "x", "y", "rotation"}, ...]``.
+    /// Pass to ``restore()`` to rewind.
+    fn snapshot(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let entries: Vec<serde_json::Value> = self
+            .inner
+            .snapshot()
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "id": e.id,
+                    "x": e.x,
+                    "y": e.y,
+                    "rotation": e.rotation,
+                })
+            })
+            .collect();
+        let json_str = serde_json::to_string(&entries)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = py.import("json")?.call_method1("loads", (json_str,))?;
+        Ok(result.into())
+    }
+
+    /// Restore the board to a previously snapshotted state.
+    ///
+    /// Args:
+    ///     snapshot: list returned by ``snapshot()``
+    fn restore(&mut self, py: Python<'_>, snapshot: &Bound<'_, PyAny>) -> PyResult<()> {
+        let json_str: String = py
+            .import("json")?
+            .call_method1("dumps", (snapshot,))?
+            .extract()?;
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&json_str)
+            .map_err(|e| PyValueError::new_err(format!("Invalid snapshot: {}", e)))?;
+        let snap: Vec<u_nesting_d2::board::SnapEntry> = entries
+            .into_iter()
+            .map(|v| u_nesting_d2::board::SnapEntry {
+                id: v["id"].as_str().unwrap_or("").to_string(),
+                x: v["x"].as_f64().unwrap_or(0.0),
+                y: v["y"].as_f64().unwrap_or(0.0),
+                rotation: v["rotation"].as_f64().unwrap_or(0.0),
+            })
+            .collect();
+        self.inner.restore(&snap);
+        Ok(())
+    }
+
+    /// Current fill ratio (0.0–1.0).
+    fn utilization(&self) -> f64 {
+        self.inner.utilization()
+    }
+
+    /// Number of parts currently placed.
+    fn placed_count(&self) -> usize {
+        self.inner.placed_count()
+    }
+
+    /// Board-space polygon vertices for every placed part.
+    ///
+    /// Returns a list of polygons: ``[[[x, y], ...], ...]``.
+    /// Vertices are already rotated and translated to board coordinates.
+    fn placed_polygons(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let polys: Vec<Vec<[f64; 2]>> = self
+            .inner
+            .placed_polygons()
+            .into_iter()
+            .map(|poly| poly.into_iter().map(|(x, y)| [x, y]).collect())
+            .collect();
+        let json_str = serde_json::to_string(&polys)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = py.import("json")?.call_method1("loads", (json_str,))?;
+        Ok(result.into())
+    }
+
+    /// Number of parts currently placed (alias for ``placed_count``).
+    fn n_placed(&self) -> usize {
+        self.inner.placed_count()
+    }
+
+    /// Ordered list of geometry IDs that have not yet been placed this episode.
+    fn remaining_ids(&self) -> Vec<String> {
+        self.inner.remaining_ids()
+    }
+
+    /// For each id in ``ids``, speculatively place it via LBF (no commit) and
+    /// return the board-space polygon vertices, or ``None`` if it doesn't fit.
+    ///
+    /// Returns a list of the same length as ``ids``: each element is either
+    /// ``[[x, y], …]`` or ``None``.
+    fn lbf_preview_all(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
+        let previews = self.inner.lbf_preview_all(&ids);
+        // Build a JSON-serialisable value: list of list-of-pairs or null
+        let values: Vec<serde_json::Value> = previews
+            .into_iter()
+            .map(|opt| match opt {
+                Some(verts) => serde_json::Value::Array(
+                    verts
+                        .into_iter()
+                        .map(|(x, y)| serde_json::json!([x, y]))
+                        .collect(),
+                ),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        let json_str = serde_json::to_string(&values)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = py.import("json")?.call_method1("loads", (json_str,))?;
+        Ok(result.into())
+    }
+
+    /// Snapshot → greedy LBF rollout on remaining parts → restore.
+    ///
+    /// Returns ``(packing_density, n_placed)`` as a Python tuple.
+    fn lbf_rollout_value(&mut self) -> (f64, usize) {
+        self.inner.lbf_rollout_value()
+    }
+
+    /// Place all remaining parts via LBF (committing each successful placement).
+    ///
+    /// Returns the number of parts successfully placed.
+    fn lbf_place_all(&mut self) -> usize {
+        self.inner.lbf_place_all()
+    }
+
+    /// ``placed_area / bbox_area`` of all placed parts (0.0 if nothing placed).
+    fn packing_density(&self) -> f64 {
+        self.inner.packing_density()
+    }
+
+    /// Axis-aligned bounding box area of all placed parts (0.0 if nothing placed).
+    fn bbox_area(&self) -> f64 {
+        self.inner.bbox_area()
+    }
+
+    /// Current placements as a list of dicts.
+    fn placements(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let entries: Vec<serde_json::Value> = self
+            .inner
+            .placements()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "geometry_id": p.geometry.id(),
+                    "position": [p.position.0, p.position.1],
+                    "rotation": p.rotation,
+                })
+            })
+            .collect();
+        let json_str = serde_json::to_string(&entries)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = py.import("json")?.call_method1("loads", (json_str,))?;
+        Ok(result.into())
+    }
+}
+
+// ── Module ───────────────────────────────────────────────────────────────────
+
 /// U-Nesting Python module.
 #[pymodule]
 fn u_nesting(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -476,5 +781,6 @@ fn u_nesting(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(solve_3d, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
     m.add_function(wrap_pyfunction!(available_strategies, m)?)?;
+    m.add_class::<Board2D>()?;
     Ok(())
 }

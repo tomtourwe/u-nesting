@@ -286,11 +286,14 @@ pub fn validate_and_filter_placements(
     result
 }
 
+pub mod board;
+
 // Re-exports
+pub use board::{Board2D, PlacementInfo, SnapEntry};
 pub use boundary::Boundary2D;
 pub use geometry::Geometry2D;
 pub use nester::Nester2D;
-pub use nfp::{NfpConfig, NfpMethod};
+pub use nfp::{NfpConfig, NfpMethod, PlacedGeometry};
 pub use spatial_index::{SpatialEntry2D, SpatialIndex2D};
 pub use u_nesting_core::{
     Boundary, Boundary2DExt, Config, Error, Geometry, Geometry2DExt, Placement, Result,
