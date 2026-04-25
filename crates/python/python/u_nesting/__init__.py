@@ -134,17 +134,17 @@ class Board2D:
         """Ordered list of geometry IDs not yet placed this episode."""
         return self._board.remaining_ids()
 
-    def lbf_preview_all(self, ids: list) -> list:
-        """Speculatively place each id via LBF; return board-space vertices or None."""
-        return self._board.lbf_preview_all(ids)
+    def preview_all(self, ids: list) -> list:
+        """Speculatively place each id (no commit); return board-space vertices or None."""
+        return self._board.preview_all(ids)
 
-    def lbf_rollout_value(self) -> tuple:
-        """Snapshot → greedy LBF fill → restore. Returns (packing_density, n_placed)."""
-        return self._board.lbf_rollout_value()
+    def rollout_value(self) -> tuple:
+        """Snapshot → greedy fill of remaining parts → restore. Returns (packing_density, n_placed)."""
+        return self._board.rollout_value()
 
-    def lbf_place_all(self) -> int:
-        """Place all remaining parts via LBF. Returns count placed."""
-        return self._board.lbf_place_all()
+    def place_remaining(self) -> int:
+        """Place all remaining parts greedily (committing each). Returns count placed."""
+        return self._board.place_remaining()
 
     def packing_density(self) -> float:
         """placed_area / bbox_area (0.0 if empty)."""

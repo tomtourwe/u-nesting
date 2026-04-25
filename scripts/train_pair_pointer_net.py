@@ -3,10 +3,10 @@ PPO training for the SplitPointerNet / SpatialPointerNet bin-packing agent.
 
 Architecture
 ------------
-No pretrained backbone. Trains entirely from random init with PPO + LBF-TD advantage.
+No pretrained backbone. Trains entirely from random init with PPO + rollout-TD advantage.
 
 At each step, for every remaining part i:
-  save board → place part i via LBF → render resulting board SDF → restore
+  save board → place part i → render resulting board SDF → restore
   pair_images = env.preview_pair_images()  →  (N, 2, 128, 128)
 
 SplitPointerNet encodes board and parts separately:
@@ -23,10 +23,10 @@ Episode loop
        a. pair_images = env.preview_pair_images()  →  (N, 2, 128, 128)
        b. part_logits = model(pair_images, mask)
        c. Sample part_id ~ Categorical(part_logits).
-       d. Ask U-Nesting to place via LBF.
+       d. Ask U-Nesting to place the part.
   3. Per-step reward: R_t = packing_density(s_{t+1}) − packing_density(s_t)
-     Value baseline: V_lbf(s) = packing density a full LBF rollout achieves from s
-     Advantage: A_t = R_t + γ·V_lbf(s_{t+1}) − V_lbf(s_t)
+     Value baseline: V(s) = packing density a greedy rollout achieves from s
+     Advantage: A_t = R_t + γ·V(s_{t+1}) − V(s_t)
   4. Loss = PPO_loss − entropy_coef·entropy
 
 Usage:
@@ -98,7 +98,7 @@ def _action_log_prob_and_entropy(
     return part_dist.log_prob(part_id), part_dist.entropy()
 
 
-def _lbf_td_advantage(R_t: float, v_curr: float, v_next: float, gamma: float) -> float:
+def _td_advantage(R_t: float, v_curr: float, v_next: float, gamma: float) -> float:
     return R_t + gamma * v_next - v_curr
 
 
@@ -120,13 +120,13 @@ def _run_episode(
     snapshots:    list               = []
     R_t_list:     list[float]        = []
     A_t_list:     list[float]        = []
-    v_lbf_list:   list[float]        = []
+    v_rollout_list: list[float]      = []
 
-    lbf_density_curr, n_lbf_curr = env.lbf_value()
-    v_curr            = lbf_density_curr
-    lbf_density_init  = lbf_density_curr
-    n_lbf_placed_init = n_lbf_curr
-    prev_density      = env.packing_density()
+    rollout_density_curr, n_rollout_curr = env.rollout_value()
+    v_curr               = rollout_density_curr
+    rollout_density_init = rollout_density_curr
+    n_rollout_placed_init = n_rollout_curr
+    prev_density         = env.packing_density()
 
     skip_ids: set[int] = set()
 
@@ -155,12 +155,12 @@ def _run_episode(
         prev_density = env.packing_density()
         R_t_list.append(R_t)
 
-        lbf_density_next, n_lbf_next = env.lbf_value()
-        v_next = lbf_density_next
-        A_t    = _lbf_td_advantage(R_t, v_curr, v_next, gamma)
+        rollout_density_next, n_rollout_next = env.rollout_value()
+        v_next = rollout_density_next
+        A_t    = _td_advantage(R_t, v_curr, v_next, gamma)
         A_t_list.append(A_t)
-        v_lbf_list.append(v_next)
-        v_curr, n_lbf_curr = v_next, n_lbf_next
+        v_rollout_list.append(v_next)
+        v_curr, n_rollout_curr = v_next, n_rollout_next
 
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
@@ -169,13 +169,13 @@ def _run_episode(
     board_area     = env.plate_w * env.plate_h
 
     stats = {
-        "lbf_density_init":   lbf_density_init,
-        "n_lbf_placed_init":  n_lbf_placed_init,
-        "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list  else 0.0,
-        "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list  else 0.0,
-        "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list  else 0.0,
-        "v_lbf_final":        v_lbf_list[-1]                            if v_lbf_list else lbf_density_init,
-        "bbox_frac":          env.bbox_area() / board_area,
+        "rollout_density_init":  rollout_density_init,
+        "n_rollout_placed_init": n_rollout_placed_init,
+        "R_t_mean":              float(np.mean(R_t_list))                  if R_t_list       else 0.0,
+        "advantage_mean":        float(np.mean(A_t_list))                  if A_t_list       else 0.0,
+        "advantage_pos_frac":    float(np.mean([a > 0 for a in A_t_list])) if A_t_list       else 0.0,
+        "v_rollout_final":       v_rollout_list[-1]                         if v_rollout_list else rollout_density_init,
+        "bbox_frac":             env.bbox_area() / board_area,
     }
 
     return log_probs, entropies, A_t_list, episode_reward, snapshots, stats, observations
@@ -268,7 +268,7 @@ def _run_greedy_eval(
         ep_geoms = env._episode_geoms()
         if ep_id < len(ep_geoms):
             geom_id = ep_geoms[ep_id]["id"]
-            previews = env._board.lbf_preview_all([geom_id])
+            previews = env._board.preview_all([geom_id])
             if previews and previews[0] is not None:
                 unplaced_polys.append(previews[0])
     return eval_density, eval_snapshots, env.n_placed(), unplaced_polys
@@ -280,13 +280,13 @@ def _make_eval_figure(
     eval_lib_ids: list[int],
     episode: int,
     args: argparse.Namespace,
-    lbf_polys: list,
-    lbf_n_placed: int,
-    lbf_density: float,
+    greedy_polys: list,
+    greedy_n_placed: int,
+    greedy_density: float,
     unplaced_polys: list | None = None,
 ) -> plt.Figure:
     all_panels = [
-        (lbf_polys, lbf_density, f"LBF  {lbf_n_placed}/{len(eval_lib_ids)}\nd={lbf_density:.3f}")
+        (greedy_polys, greedy_density, f"Greedy  {greedy_n_placed}/{len(eval_lib_ids)}\nd={greedy_density:.3f}")
     ] + [
         (polys, density,
          f"ep {episode+1}  agent {eval_n_placed}/{len(eval_lib_ids)}\n#{i+1}  d={density:.3f}"
@@ -346,25 +346,25 @@ def _log_training_step(
     print(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"placed={n_placed}/{n_parts_ep}  "
-        f"density={reward:.4f}  lbf={stats['lbf_density_init']:.4f}"
+        f"density={reward:.4f}  rollout={stats['rollout_density_init']:.4f}"
         f"  adv={stats['advantage_mean']:+.4f}({pos_pct}%+)"
         f"  loss={loss.item():.4f}",
         end=end_char, flush=True,
     )
 
     wandb.log({
-        "reward/board_density":     reward,
-        "loss/total":               loss.item(),
-        "loss/entropy_bonus":       entropy_bonus.item(),
-        "train/R_t_mean":           stats["R_t_mean"],
-        "train/bbox_frac":          stats["bbox_frac"],
-        "lbf/density_init":         stats["lbf_density_init"],
-        "lbf/n_placed_init":        stats["n_lbf_placed_init"],
-        "lbf/v_final":              stats["v_lbf_final"],
-        "train/advantage_mean":     stats["advantage_mean"],
-        "train/advantage_pos_frac": stats["advantage_pos_frac"],
-        "train/lbf_gap":            stats["R_t_mean"] - stats["advantage_mean"],
-        "episode":                  episode + 1,
+        "reward/board_density":      reward,
+        "loss/total":                loss.item(),
+        "loss/entropy_bonus":        entropy_bonus.item(),
+        "train/R_t_mean":            stats["R_t_mean"],
+        "train/bbox_frac":           stats["bbox_frac"],
+        "rollout/density_init":      stats["rollout_density_init"],
+        "rollout/n_placed_init":     stats["n_rollout_placed_init"],
+        "rollout/v_final":           stats["v_rollout_final"],
+        "train/advantage_mean":      stats["advantage_mean"],
+        "train/advantage_pos_frac":  stats["advantage_pos_frac"],
+        "train/rollout_gap":         stats["R_t_mean"] - stats["advantage_mean"],
+        "episode":                   episode + 1,
     }, step=episode + 1)
 
 
@@ -379,14 +379,14 @@ def _log_eval_set(
     n = len(eval_configs)
     print(f"[eval]  ep={episode+1:>5}/{args.episodes}  {n} configs …", end="", flush=True)
 
-    ratios, agent_densities, lbf_densities, n_placed_list, n_lbf_list = [], [], [], [], []
-    plot_snapshots = plot_lbf_polys = plot_lib_ids = plot_unplaced_polys = None
-    plot_n_placed = plot_n_lbf = 0
-    plot_lbf_density = 0.0
-    best_n_lbf = -1
-    worst_snapshots = worst_lbf_polys = worst_lib_ids = worst_unplaced_polys = None
-    worst_n_placed = worst_n_lbf = 0
-    worst_lbf_density = 0.0
+    ratios, agent_densities, greedy_densities, n_placed_list, n_greedy_list = [], [], [], [], []
+    plot_snapshots = plot_greedy_polys = plot_lib_ids = plot_unplaced_polys = None
+    plot_n_placed = plot_n_greedy = 0
+    plot_greedy_density = 0.0
+    best_n_greedy = -1
+    worst_snapshots = worst_greedy_polys = worst_lib_ids = worst_unplaced_polys = None
+    worst_n_placed = worst_n_greedy = 0
+    worst_greedy_density = 0.0
     worst_ratio = float("inf")
 
     for lib_ids in eval_configs:
@@ -394,68 +394,68 @@ def _log_eval_set(
             env, model, lib_ids, device, args
         )
         env.reset(lib_ids)
-        n_lbf       = env.lbf_place_all()
-        lbf_polys   = env.placed_polygons()
-        lbf_density = env.packing_density()
-        ratio       = agent_density / lbf_density if lbf_density > 0 else float("nan")
+        n_greedy       = env.place_remaining()
+        greedy_polys   = env.placed_polygons()
+        greedy_density = env.packing_density()
+        ratio          = agent_density / greedy_density if greedy_density > 0 else float("nan")
 
         ratios.append(ratio)
         agent_densities.append(agent_density)
-        lbf_densities.append(lbf_density)
+        greedy_densities.append(greedy_density)
         n_placed_list.append(n_placed)
-        n_lbf_list.append(n_lbf)
+        n_greedy_list.append(n_greedy)
 
-        if n_lbf > best_n_lbf:
-            best_n_lbf          = n_lbf
-            plot_snapshots      = snapshots
-            plot_lbf_polys      = lbf_polys
-            plot_lib_ids        = lib_ids
-            plot_n_placed       = n_placed
-            plot_n_lbf          = n_lbf
-            plot_lbf_density    = lbf_density
-            plot_unplaced_polys = unplaced_polys
+        if n_greedy > best_n_greedy:
+            best_n_greedy        = n_greedy
+            plot_snapshots       = snapshots
+            plot_greedy_polys    = greedy_polys
+            plot_lib_ids         = lib_ids
+            plot_n_placed        = n_placed
+            plot_n_greedy        = n_greedy
+            plot_greedy_density  = greedy_density
+            plot_unplaced_polys  = unplaced_polys
 
         if not np.isnan(ratio) and ratio < worst_ratio:
-            worst_ratio          = ratio
-            worst_snapshots      = snapshots
-            worst_lbf_polys      = lbf_polys
-            worst_lib_ids        = lib_ids
-            worst_n_placed       = n_placed
-            worst_n_lbf          = n_lbf
-            worst_lbf_density    = lbf_density
-            worst_unplaced_polys = unplaced_polys
+            worst_ratio           = ratio
+            worst_snapshots       = snapshots
+            worst_greedy_polys    = greedy_polys
+            worst_lib_ids         = lib_ids
+            worst_n_placed        = n_placed
+            worst_n_greedy        = n_greedy
+            worst_greedy_density  = greedy_density
+            worst_unplaced_polys  = unplaced_polys
 
-    mean_ratio      = float(np.mean(ratios))
-    std_ratio       = float(np.std(ratios))
-    max_ratio       = float(np.max(ratios))
-    pct_above       = int(round(100 * np.mean([r > 1.0 for r in ratios])))
-    mean_placed     = float(np.mean(n_placed_list))
-    mean_lbf_placed = float(np.mean(n_lbf_list))
-    mean_agent      = float(np.mean(agent_densities))
-    mean_lbf        = float(np.mean(lbf_densities))
+    mean_ratio         = float(np.mean(ratios))
+    std_ratio          = float(np.std(ratios))
+    max_ratio          = float(np.max(ratios))
+    pct_above          = int(round(100 * np.mean([r > 1.0 for r in ratios])))
+    mean_placed        = float(np.mean(n_placed_list))
+    mean_greedy_placed = float(np.mean(n_greedy_list))
+    mean_agent         = float(np.mean(agent_densities))
+    mean_greedy        = float(np.mean(greedy_densities))
 
     print(f"  ratio={mean_ratio:.3f}±{std_ratio:.3f} max={max_ratio:.3f} ({pct_above}%>1)"
-          f"  mean_density={mean_agent:.4f}  mean_lbf={mean_lbf:.4f}"
-          f"  mean_placed={mean_placed:.1f} vs lbf={mean_lbf_placed:.1f}/{len(plot_lib_ids)}")
+          f"  mean_density={mean_agent:.4f}  mean_greedy={mean_greedy:.4f}"
+          f"  mean_placed={mean_placed:.1f} vs greedy={mean_greedy_placed:.1f}/{len(plot_lib_ids)}")
 
     fig_best = _make_eval_figure(
         plot_snapshots, plot_n_placed, plot_lib_ids, episode, args,
-        plot_lbf_polys, plot_n_lbf, plot_lbf_density, plot_unplaced_polys,
+        plot_greedy_polys, plot_n_greedy, plot_greedy_density, plot_unplaced_polys,
     )
     fig_worst = _make_eval_figure(
         worst_snapshots, worst_n_placed, worst_lib_ids, episode, args,
-        worst_lbf_polys, worst_n_lbf, worst_lbf_density, worst_unplaced_polys,
+        worst_greedy_polys, worst_n_greedy, worst_greedy_density, worst_unplaced_polys,
     )
     wandb.log({
-        "eval/board_best":       wandb.Image(fig_best),
-        "eval/board_worst":      wandb.Image(fig_worst),
-        "eval/ratio_mean":       mean_ratio,
-        "eval/ratio_std":        std_ratio,
-        "eval/ratio_max":        max_ratio,
-        "eval/pct_above_lbf":    pct_above,
-        "eval/density_mean":     mean_agent,
-        "eval/lbf_density_mean": mean_lbf,
-        "eval/placed_mean":      mean_placed,
+        "eval/board_best":           wandb.Image(fig_best),
+        "eval/board_worst":          wandb.Image(fig_worst),
+        "eval/ratio_mean":           mean_ratio,
+        "eval/ratio_std":            std_ratio,
+        "eval/ratio_max":            max_ratio,
+        "eval/pct_above_greedy":     pct_above,
+        "eval/density_mean":         mean_agent,
+        "eval/greedy_density_mean":  mean_greedy,
+        "eval/placed_mean":          mean_placed,
     }, step=episode + 1)
     plt.close(fig_best)
     plt.close(fig_worst)

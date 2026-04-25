@@ -1,7 +1,7 @@
 """
 RL Environment — bridges the neural network and the U-Nesting engine.
 
-The agent predicts which part to place next; the engine's LBF heuristic
+The agent predicts which part to place next; the engine's NFP-guided heuristic
 determines the (x, y, rotation).  The episode ends when no more parts fit.
 
 Library JSON format (u-nesting format):
@@ -42,8 +42,8 @@ class UNestingGymEnv:
     The RL environment for U-Nesting.
 
     Each episode, a random set of N parts is selected from a shape library.
-    The agent predicts which part to place next; the LBF heuristic in the
-    Rust engine determines the (x, y, rotation).
+    The agent predicts which part to place next; the NFP-guided engine
+    determines the (x, y, rotation).
 
     Args:
         json_path   : path to shape library JSON (u-nesting format)
@@ -143,24 +143,24 @@ class UNestingGymEnv:
 
     def place_anywhere(self, episode_id: int) -> bool:
         """
-        Let the Rust engine place part `episode_id` wherever it fits best (LBF).
+        Let the Rust engine place part `episode_id` at the best valid position.
 
         Returns True if the part was placed, False if it doesn't fit.
         """
         geom_id = self._episode_geoms()[episode_id]["id"]
         return self._board.place(geom_id) is not None
 
-    def lbf_value(self) -> tuple[float, int]:
+    def rollout_value(self) -> tuple[float, int]:
         """
-        Run a full LBF rollout on remaining parts, then restore the board.
+        Run a greedy rollout on remaining parts, then restore the board.
 
         Returns (packing_density, n_placed):
           packing_density — placed_area / bbox_area after the greedy fill
-          n_placed        — how many additional parts LBF managed to place
+          n_placed        — how many additional parts the greedy fill placed
 
         Used as a per-step value baseline during training.
         """
-        return self._board.lbf_rollout_value()
+        return self._board.rollout_value()
 
     def packing_density(self) -> float:
         """Placed area / bounding-box area of all placed parts (0.0 if empty)."""
@@ -178,14 +178,14 @@ class UNestingGymEnv:
         """Board-space polygon vertices for every placed part."""
         return self._board.placed_polygons()
 
-    def lbf_place_all(self) -> int:
+    def place_remaining(self) -> int:
         """
-        Greedily place all remaining parts via LBF (committing each).
+        Greedily place all remaining parts (committing each).
 
         Returns the number of parts placed. Used during evaluation to get the
-        LBF baseline density for a given episode configuration.
+        greedy baseline density for a given episode configuration.
         """
-        return self._board.lbf_place_all()
+        return self._board.place_remaining()
 
     def remaining_item_ids(self) -> list[int]:
         """
@@ -210,7 +210,7 @@ class UNestingGymEnv:
         Build (N, 2, IMG, IMG) pair images for the current step.
 
         Channel 0: current board SDF — same for all N candidates.
-        Channel 1: board SDF after hypothetically placing part i via LBF.
+        Channel 1: board SDF after hypothetically placing part i.
                    Already-placed or unplaceable parts keep channel 1 = current SDF.
 
         Uses the min-distance trick: EDT runs once on the current board and once
@@ -229,7 +229,7 @@ class UNestingGymEnv:
 
         # String IDs of remaining parts (for the Rust batch preview call)
         remaining_str = [episode_geoms[ep_id]["id"] for ep_id in remaining_eps]
-        preview_verts = self._board.lbf_preview_all(remaining_str)  # list[list|None]
+        preview_verts = self._board.preview_all(remaining_str)  # list[list|None]
         # Map string_id → board-space vertices (or None)
         preview_map: dict[str, list | None] = dict(zip(remaining_str, preview_verts))
 

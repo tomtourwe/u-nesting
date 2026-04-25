@@ -57,7 +57,7 @@ impl Board2D {
     /// Creates a new board with an explicit rollout step multiplier.
     ///
     /// `rollout_step_multiplier` scales the grid step used inside
-    /// `lbf_rollout_value`, `lbf_place_all`, and `lbf_preview_all`.
+    /// `rollout_value`, `place_remaining`, and `preview_all`.
     /// A larger multiplier means fewer grid points → faster rollouts at the
     /// cost of slightly coarser speculative placements (value estimates only).
     /// Committed `place()` calls always use the fine grid.
@@ -242,7 +242,7 @@ impl Board2D {
     /// Uses the coarse rollout grid — fast enough for per-step observation
     /// building. Each candidate is evaluated in parallel when the `parallel`
     /// feature is enabled.
-    pub fn lbf_preview_all(&self, ids: &[String]) -> Vec<Option<Vec<(f64, f64)>>> {
+    pub fn preview_all(&self, ids: &[String]) -> Vec<Option<Vec<(f64, f64)>>> {
         let step = self.rollout_sample_step;
         #[cfg(feature = "parallel")]
         {
@@ -281,7 +281,7 @@ impl Board2D {
     ///
     /// Uses the coarse grid for speed. Returns `(packing_density, n_placed)`.
     /// Used as a per-step value baseline during RL training.
-    pub fn lbf_rollout_value(&mut self) -> (f64, usize) {
+    pub fn rollout_value(&mut self) -> (f64, usize) {
         let snap = self.snapshot();
         let remaining = self.remaining_ids();
         let mut n_placed = 0usize;
@@ -298,7 +298,7 @@ impl Board2D {
     /// Place all remaining parts via the coarse grid (committing each).
     ///
     /// Used for evaluation baselines. Returns the number placed.
-    pub fn lbf_place_all(&mut self) -> usize {
+    pub fn place_remaining(&mut self) -> usize {
         let remaining = self.remaining_ids();
         let mut n_placed = 0usize;
         for id in &remaining {

@@ -723,13 +723,13 @@ impl Board2D {
         self.inner.remaining_ids()
     }
 
-    /// For each id in ``ids``, speculatively place it via LBF (no commit) and
-    /// return the board-space polygon vertices, or ``None`` if it doesn't fit.
+    /// For each id in ``ids``, speculatively place it (no commit) and return
+    /// the board-space polygon vertices, or ``None`` if it doesn't fit.
     ///
     /// Returns a list of the same length as ``ids``: each element is either
     /// ``[[x, y], …]`` or ``None``.
-    fn lbf_preview_all(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
-        let previews = py.allow_threads(|| self.inner.lbf_preview_all(&ids));
+    fn preview_all(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
+        let previews = py.allow_threads(|| self.inner.preview_all(&ids));
         // Build a JSON-serialisable value: list of list-of-pairs or null
         let values: Vec<serde_json::Value> = previews
             .into_iter()
@@ -749,18 +749,18 @@ impl Board2D {
         Ok(result.into())
     }
 
-    /// Snapshot → greedy LBF rollout on remaining parts → restore.
+    /// Snapshot → greedy rollout on remaining parts → restore.
     ///
     /// Returns ``(packing_density, n_placed)`` as a Python tuple.
-    fn lbf_rollout_value(&mut self, py: Python<'_>) -> (f64, usize) {
-        py.allow_threads(|| self.inner.lbf_rollout_value())
+    fn rollout_value(&mut self, py: Python<'_>) -> (f64, usize) {
+        py.allow_threads(|| self.inner.rollout_value())
     }
 
-    /// Place all remaining parts via LBF (committing each successful placement).
+    /// Place all remaining parts greedily (committing each successful placement).
     ///
     /// Returns the number of parts successfully placed.
-    fn lbf_place_all(&mut self) -> usize {
-        self.inner.lbf_place_all()
+    fn place_remaining(&mut self) -> usize {
+        self.inner.place_remaining()
     }
 
     /// ``placed_area / bbox_area`` of all placed parts (0.0 if nothing placed).
