@@ -355,21 +355,28 @@ def _log_training_step(
     )
 
     hits, misses, cache_size = env._board._board.cache_stats()
-    total = hits + misses
-    hit_rate = hits / total if total > 0 else 0.0
+    ep_misses = misses - _log_training_step._prev_misses
+    ep_hits   = hits   - _log_training_step._prev_hits
+    ep_total  = ep_hits + ep_misses
+    ep_hit_rate = ep_hits / ep_total if ep_total > 0 else 0.0
+    _log_training_step._prev_misses = misses
+    _log_training_step._prev_hits   = hits
 
     wandb.log({
-        "agent/density":        reward,
-        "agent/parts_placed":   n_placed / n_parts_ep,
-        "agent/vs_greedy":      vs_greedy,
-        "greedy/density":       greedy_d,
-        "greedy/parts_placed":  n_rollout / n_parts_ep,
-        "loss/total":           loss.item(),
-        "perf/episode_time_s":  episode_time,
-        "cache/hit_rate":       hit_rate,
-        "cache/size":           cache_size,
-        "cache/misses":         misses,
+        "agent/density":           reward,
+        "agent/parts_placed":      n_placed / n_parts_ep,
+        "agent/vs_greedy":         vs_greedy,
+        "greedy/density":          greedy_d,
+        "greedy/parts_placed":     n_rollout / n_parts_ep,
+        "loss/total":              loss.item(),
+        "perf/episode_time_s":     episode_time,
+        "cache/hit_rate":          ep_hit_rate,
+        "cache/misses_per_episode": ep_misses,
+        "cache/size":              cache_size,
     }, step=episode + 1)
+
+_log_training_step._prev_misses = 0
+_log_training_step._prev_hits   = 0
 
 
 def _log_eval_set(
