@@ -64,7 +64,7 @@ source "$HOME/.cargo/env"
 # ── 4. Build Maturin Python bindings ─────────────────────────────────────────
 echo "[setup] Step 4/4 — Building Rust/Python bindings (maturin) …"
 MATURIN_TMPDIR=$(mktemp -d)
-TMPDIR="$MATURIN_TMPDIR" .venv/bin/maturin develop --manifest-path crates/python/Cargo.toml --release --features python-bindings
+TMPDIR="$MATURIN_TMPDIR" .venv/bin/maturin develop --manifest-path crates/python/Cargo.toml --release
 rm -rf "$MATURIN_TMPDIR"
 echo "[setup] Maturin build complete"
 
