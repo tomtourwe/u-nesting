@@ -2,10 +2,26 @@
 set -euo pipefail
 
 # ── 1. Python venv ────────────────────────────────────────────────────────────
+# PyO3 0.24 supports Python 3.7–3.13 natively; 3.14+ works via the
+# PYO3_USE_ABI3_FORWARD_COMPATIBILITY flag set in .cargo/config.toml.
+# Prefer 3.12 → 3.11 → 3.10 → 3.13 → fall back to whatever python3 is.
 echo "[setup] Step 1/4 — Python virtual environment"
+PYTHON=""
+for candidate in python3.12 python3.11 python3.10 python3.13 python3; do
+    if command -v "$candidate" &>/dev/null; then
+        PYTHON="$candidate"
+        break
+    fi
+done
+if [ -z "$PYTHON" ]; then
+    echo "[setup] ERROR: no Python interpreter found" >&2
+    exit 1
+fi
+echo "[setup] Using Python: $PYTHON ($(${PYTHON} --version))"
+
 if [ ! -d ".venv" ]; then
     echo "[setup] Creating .venv …"
-    python3 -m venv .venv
+    "$PYTHON" -m venv .venv
 else
     echo "[setup] .venv already exists, skipping creation"
 fi
