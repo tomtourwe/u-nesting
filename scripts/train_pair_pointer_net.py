@@ -505,16 +505,6 @@ def train(args: argparse.Namespace) -> None:
         f"─────────────────────────────────────────────────────────────────────\n"
     )
 
-    if args.warmup_episodes > 0:
-        warm_rng = random.Random(args.rng_seed)
-        print(f"Warming NFP cache ({args.warmup_episodes} episodes)…", end="", flush=True)
-        for i in range(args.warmup_episodes):
-            warm_ids = env.sample_episode_ids(n=args.n_parts, rng=warm_rng)
-            env.reset(warm_ids)
-            env.place_remaining()
-            if (i + 1) % 10 == 0:
-                print(f" {i+1}", end="", flush=True)
-        print(" done.")
 
     best_density      = 0.0
     last_eval_density = 0.0
@@ -596,8 +586,6 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",            type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
-    p.add_argument("--warmup-episodes",      type=int,   default=50,
-                   help="Greedy rollouts run before training to warm the NFP cache (default 50).")
     p.add_argument("--rotations",           type=float, nargs="+", default=None,
                    metavar="DEG",
                    help="Allowed rotation angles in degrees for all parts "
