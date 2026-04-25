@@ -38,6 +38,7 @@ import argparse
 import math
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -337,6 +338,7 @@ def _log_training_step(
     entropy_bonus: torch.Tensor,
     entropy_coef: float,
     stats: dict,
+    episode_time: float,
 ) -> None:
     n_placed  = env.n_placed()
     n_rollout = stats["n_rollout_placed_init"]
@@ -348,7 +350,7 @@ def _log_training_step(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
         f"density={reward:.4f}  greedy={greedy_d:.4f}  vs_greedy={vs_greedy:+.3f}"
-        f"  loss={loss.item():.4f}",
+        f"  loss={loss.item():.4f}  t={episode_time:.1f}s",
         end=end_char, flush=True,
     )
 
@@ -359,6 +361,7 @@ def _log_training_step(
         "greedy/density":       greedy_d,
         "greedy/parts_placed":  n_rollout / n_parts_ep,
         "loss/total":           loss.item(),
+        "perf/episode_time_s":  episode_time,
     }, step=episode + 1)
 
 
@@ -510,6 +513,7 @@ def train(args: argparse.Namespace) -> None:
     last_eval_density = 0.0
 
     for episode in range(args.episodes):
+        t0         = time.perf_counter()
         n_parts_ep = _curriculum_n_parts(episode, args)
         lib_ids    = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
         model.train()
@@ -538,8 +542,9 @@ def train(args: argparse.Namespace) -> None:
         else:
             loss = entropy_bonus = torch.tensor(0.0)
 
+        episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
-                           entropy_coef, stats)
+                           entropy_coef, stats, episode_time)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(env, model, eval_configs, device, args, episode)
