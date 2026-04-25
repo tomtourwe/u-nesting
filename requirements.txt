@@ -1,0 +1,6 @@
+maturin
+numpy
+pillow
+scipy
+wandb
+matplotlib
