@@ -283,7 +283,12 @@ impl Board2D {
     /// Used as a per-step value baseline during RL training.
     pub fn rollout_value(&mut self) -> (f64, usize) {
         let snap = self.snapshot();
-        let remaining = self.remaining_ids();
+        let mut remaining = self.remaining_ids();
+        remaining.sort_by(|a, b| {
+            let area_a = self.geom_map.get(a).map_or(0.0, |g| g.measure());
+            let area_b = self.geom_map.get(b).map_or(0.0, |g| g.measure());
+            area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut n_placed = 0usize;
         for id in &remaining {
             if let Ok(Some(_)) = self.place_fast(id) {
@@ -299,7 +304,12 @@ impl Board2D {
     ///
     /// Used for evaluation baselines. Returns the number placed.
     pub fn place_remaining(&mut self) -> usize {
-        let remaining = self.remaining_ids();
+        let mut remaining = self.remaining_ids();
+        remaining.sort_by(|a, b| {
+            let area_a = self.geom_map.get(a).map_or(0.0, |g| g.measure());
+            let area_b = self.geom_map.get(b).map_or(0.0, |g| g.measure());
+            area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut n_placed = 0usize;
         for id in &remaining {
             if let Ok(Some(_)) = self.place_fast(id) {
