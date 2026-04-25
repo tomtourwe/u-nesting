@@ -187,6 +187,7 @@ def _build_env(args: argparse.Namespace) -> UNestingGymEnv:
         plate_width=args.plate_width,
         plate_height=args.plate_height,
         sdf_clip_px=args.sdf_clip_px,
+        rotations=args.rotations,
     )
 
 
@@ -579,6 +580,11 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",            type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
+    p.add_argument("--rotations",           type=float, nargs="+", default=None,
+                   metavar="DEG",
+                   help="Allowed rotation angles in degrees for all parts "
+                        "(e.g. --rotations 0 90 180 270). "
+                        "If omitted, uses each part's own rotation list from the library.")
     return p.parse_args()
 
 

@@ -62,6 +62,7 @@ class UNestingGymEnv:
         plate_height: float,
         sdf_clip_px: int = 8,
         config: dict | None = None,
+        rotations: list[float] | None = None,
     ):
         with open(json_path) as f:
             raw = json.load(f)
@@ -70,13 +71,17 @@ class UNestingGymEnv:
         if isinstance(raw, list):
             self._library: list[dict] = raw
         elif isinstance(raw, dict) and "items" in raw:
-            # Convert sparrow format to u-nesting format on the fly
+            # Convert sparrow format — orientations come from CLI, not the library
             self._library = [
-                {"id": str(i), "polygon": item["shape"]["data"]}
+                {"id": item.get("label", str(i)), "polygon": item["shape"]["data"]}
                 for i, item in enumerate(raw["items"])
             ]
         else:
             raise ValueError(f"Unrecognised library format in {json_path}")
+
+        # Rotations to apply to every part (degrees). None = use whatever the
+        # library specifies; an explicit list overrides all library rotations.
+        self._rotations = rotations
 
         self.plate_w      = plate_width
         self.plate_h      = plate_height
@@ -116,6 +121,8 @@ class UNestingGymEnv:
         """
         self.current_lib_ids = list(lib_ids)
         episode_geoms = [self._library[i] for i in lib_ids]
+        if self._rotations is not None:
+            episode_geoms = [{**g, "rotations": self._rotations} for g in episode_geoms]
         self._board = _RustBoard2D(
             boundary=self._boundary,
             geometries=episode_geoms,

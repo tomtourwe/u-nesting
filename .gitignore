@@ -43,6 +43,7 @@ temp_*.json
 !docs/json-schema/*.json
 !benchmark/scenarios/*.json
 !demo/*.html
+!data/*.json
 
 # Coverage
 lcov.info
