@@ -343,9 +343,10 @@ def _log_training_step(
 
     # Single overwriting progress line — one per episode.
     end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
+    n_rollout = stats["n_rollout_placed_init"]
     print(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
-        f"placed={n_placed}/{n_parts_ep}  "
+        f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
         f"density={reward:.4f}  rollout={stats['rollout_density_init']:.4f}"
         f"  adv={stats['advantage_mean']:+.4f}({pos_pct}%+)"
         f"  loss={loss.item():.4f}",
