@@ -93,9 +93,22 @@ class UNestingGymEnv:
 
         self._boundary = {"width": plate_width, "height": plate_height}
 
+        # Build full-library geometry list with rotations applied upfront.
+        # One Board2D is created here and reused across all episodes so the
+        # NFP cache warms up over time instead of being discarded each reset.
+        full_geoms = (
+            [{**g, "rotations": rotations} for g in self._library]
+            if rotations is not None
+            else self._library
+        )
+        self._board = _RustBoard2D(
+            boundary=self._boundary,
+            geometries=full_geoms,
+            config=self._config,
+        )
+
         # Set per episode
         self.current_lib_ids: list[int] = []
-        self._board: _RustBoard2D | None = None
 
     # ------------------------------------------------------------------
     # Episode management
@@ -116,18 +129,13 @@ class UNestingGymEnv:
         """
         Start a fresh episode with the given library indices.
 
-        Creates a new Board2D containing only the selected parts. Episode IDs
-        (0, 1, 2, …) map to lib_ids positionally.
+        Reuses the shared Board2D (preserving the NFP cache) and activates
+        only the selected parts for this episode. Episode IDs (0, 1, 2, …)
+        map to lib_ids positionally.
         """
         self.current_lib_ids = list(lib_ids)
-        episode_geoms = [self._library[i] for i in lib_ids]
-        if self._rotations is not None:
-            episode_geoms = [{**g, "rotations": self._rotations} for g in episode_geoms]
-        self._board = _RustBoard2D(
-            boundary=self._boundary,
-            geometries=episode_geoms,
-            config=self._config,
-        )
+        episode_str_ids = [self._library[i]["id"] for i in lib_ids]
+        self._board.start_episode(episode_str_ids)
 
     # ------------------------------------------------------------------
     # Core step interface

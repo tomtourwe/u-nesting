@@ -38,17 +38,21 @@ use u_nesting_core::timing::Timer;
 pub struct Nester2D {
     config: Config,
     cancelled: Arc<AtomicBool>,
-    #[allow(dead_code)] // Will be used for caching in future optimization
     nfp_cache: NfpCache,
 }
 
 impl Nester2D {
     /// Creates a new nester with the given configuration.
     pub fn new(config: Config) -> Self {
+        Self::with_nfp_cache_size(config, 1_000)
+    }
+
+    /// Creates a nester with a custom NFP cache capacity.
+    pub fn with_nfp_cache_size(config: Config, cache_size: usize) -> Self {
         Self {
             config,
             cancelled: Arc::new(AtomicBool::new(false)),
-            nfp_cache: NfpCache::new(),
+            nfp_cache: NfpCache::with_capacity(cache_size),
         }
     }
 

@@ -92,6 +92,16 @@ class Board2D:
         """Remove all placed parts."""
         self._board.reset()
 
+    def start_episode(self, ids: list) -> None:
+        """
+        Start a new episode using a subset of the board's library.
+
+        Clears placed parts and sets the active episode to ``ids`` (list of
+        geometry ID strings).  The NFP cache is preserved so cached computations
+        from previous episodes are reused, making training faster over time.
+        """
+        self._board.start_episode(ids)
+
     def snapshot(self) -> list:
         """Lightweight board snapshot. Pass to ``restore()`` to rewind."""
         return self._board.snapshot()

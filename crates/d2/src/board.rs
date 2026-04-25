@@ -42,18 +42,34 @@ pub struct Board2D {
     placed: Vec<PlacedGeometry>,
     geom_map: HashMap<String, Geometry2D>,
     episode_ids: Vec<String>,
+    /// Fine grid step used for committed placements (accurate board state).
     sample_step: f64,
+    /// Coarse grid step used for rollout/preview operations (faster, value-only).
+    rollout_sample_step: f64,
 }
 
 impl Board2D {
-    /// Creates a new board.
-    ///
-    /// `geometries` is the full set of parts that will ever be placed on this
-    /// board. It is used to pre-compute a good grid sample step and to look up
-    /// geometry definitions during `restore`.
+    /// Creates a new board with default rollout step multiplier (3×).
     pub fn new(boundary: Boundary2D, geometries: &[Geometry2D], config: Config) -> Self {
+        Self::new_with_rollout_multiplier(boundary, geometries, config, 3.0)
+    }
+
+    /// Creates a new board with an explicit rollout step multiplier.
+    ///
+    /// `rollout_step_multiplier` scales the grid step used inside
+    /// `lbf_rollout_value`, `lbf_place_all`, and `lbf_preview_all`.
+    /// A larger multiplier means fewer grid points → faster rollouts at the
+    /// cost of slightly coarser speculative placements (value estimates only).
+    /// Committed `place()` calls always use the fine grid.
+    pub fn new_with_rollout_multiplier(
+        boundary: Boundary2D,
+        geometries: &[Geometry2D],
+        config: Config,
+        rollout_step_multiplier: f64,
+    ) -> Self {
         let nester = Nester2D::new(config);
         let sample_step = nester.compute_sample_step(geometries);
+        let rollout_sample_step = (sample_step * rollout_step_multiplier).clamp(sample_step, 50.0);
         let boundary_measure = boundary.measure();
         let geom_map: HashMap<String, Geometry2D> = geometries
             .iter()
@@ -69,23 +85,45 @@ impl Board2D {
             geom_map,
             episode_ids,
             sample_step,
+            rollout_sample_step,
         }
     }
 
     /// Attempts to place the geometry with the given id onto the board.
     ///
-    /// The engine finds the best valid position across all allowed rotations.
+    /// Uses the fine grid step — positions are accurate for board-state quality.
     /// Returns `Some(PlacementInfo)` on success, `None` if the part doesn't fit.
     pub fn place(&mut self, id: &str) -> Result<Option<PlacementInfo>> {
         let geom = match self.geom_map.get(id) {
             Some(g) => g.clone(),
             None => return Ok(None),
         };
+        match self.nester.place_one_part(&geom, &self.placed, &self.boundary, self.sample_step)? {
+            Some((x, y, rotation)) => {
+                self.placed.push(PlacedGeometry::new(geom.clone(), (x, y), rotation));
+                Ok(Some(PlacementInfo { geometry_id: id.to_string(), x, y, rotation }))
+            }
+            None => Ok(None),
+        }
+    }
 
-        match self
-            .nester
-            .place_one_part(&geom, &self.placed, &self.boundary, self.sample_step)?
-        {
+    /// Like `place()` but uses the coarser rollout grid step.
+    ///
+    /// NFP vertex candidates are still included (for placement quality) but the
+    /// supplementary grid is sparser. Only used for value-estimation rollouts;
+    /// committed placements always use the fine-grid `place()`.
+    fn place_fast(&mut self, id: &str) -> Result<Option<PlacementInfo>> {
+        let geom = match self.geom_map.get(id) {
+            Some(g) => g.clone(),
+            None => return Ok(None),
+        };
+
+        match self.nester.place_one_part(
+            &geom,
+            &self.placed,
+            &self.boundary,
+            self.rollout_sample_step,
+        )? {
             Some((x, y, rotation)) => {
                 self.placed
                     .push(PlacedGeometry::new(geom.clone(), (x, y), rotation));
@@ -108,6 +146,22 @@ impl Board2D {
     /// Removes all placed geometries.
     pub fn reset(&mut self) {
         self.placed.clear();
+    }
+
+    /// Start a new episode with the given geometry IDs (a subset of the board's library).
+    ///
+    /// Clears all placed parts and sets the active episode to the given IDs.
+    /// The underlying `Nester2D` — and crucially its NFP cache — is preserved,
+    /// so cached NFPs from previous episodes are reused in future ones.
+    ///
+    /// IDs not present in the geometry map are silently ignored.
+    pub fn start_episode(&mut self, ids: &[String]) {
+        self.placed.clear();
+        self.episode_ids = ids
+            .iter()
+            .filter(|id| self.geom_map.contains_key(*id))
+            .cloned()
+            .collect();
     }
 
     /// Returns a lightweight snapshot of the current board state.
@@ -154,9 +208,6 @@ impl Board2D {
     }
 
     /// Returns the board-space polygon vertices for every placed part.
-    ///
-    /// Each entry is the exterior ring of one placed geometry, already
-    /// rotated and translated to its position on the board.
     pub fn placed_polygons(&self) -> Vec<Vec<(f64, f64)>> {
         self.placed
             .iter()
@@ -175,9 +226,6 @@ impl Board2D {
     }
 
     /// Returns the ordered list of geometry IDs that have not yet been placed.
-    ///
-    /// Order matches the episode insertion order (i.e. the order `geometries`
-    /// was passed to `new()`), which ensures deterministic LBF rollouts.
     pub fn remaining_ids(&self) -> Vec<String> {
         let placed_ids: std::collections::HashSet<String> =
             self.placed.iter().map(|p| p.geometry.id().to_string()).collect();
@@ -188,42 +236,57 @@ impl Board2D {
             .collect()
     }
 
-    /// For each geometry id in `ids`, speculatively place it via LBF (no commit)
-    /// and return the board-space polygon vertices, or `None` if it doesn't fit.
+    /// For each geometry id in `ids`, speculatively place it (no commit) and
+    /// return the board-space polygon vertices, or `None` if it doesn't fit.
     ///
-    /// The current `placed` state is not modified.
+    /// Uses the coarse rollout grid — fast enough for per-step observation
+    /// building. Each candidate is evaluated in parallel when the `parallel`
+    /// feature is enabled.
     pub fn lbf_preview_all(&self, ids: &[String]) -> Vec<Option<Vec<(f64, f64)>>> {
-        ids.iter()
-            .map(|id| {
-                let geom = self.geom_map.get(id)?;
-                match self
-                    .nester
-                    .place_one_part(geom, &self.placed, &self.boundary, self.sample_step)
-                {
-                    Ok(Some((x, y, rotation))) => {
-                        let pg = PlacedGeometry::new(geom.clone(), (x, y), rotation);
-                        Some(pg.translated_exterior())
+        let step = self.rollout_sample_step;
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            ids.par_iter()
+                .map(|id| {
+                    let geom = self.geom_map.get(id)?;
+                    match self.nester.place_one_part(geom, &self.placed, &self.boundary, step) {
+                        Ok(Some((x, y, rotation))) => {
+                            let pg = PlacedGeometry::new(geom.clone(), (x, y), rotation);
+                            Some(pg.translated_exterior())
+                        }
+                        _ => None,
                     }
-                    _ => None,
-                }
-            })
-            .collect()
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            ids.iter()
+                .map(|id| {
+                    let geom = self.geom_map.get(id)?;
+                    match self.nester.place_one_part(geom, &self.placed, &self.boundary, step) {
+                        Ok(Some((x, y, rotation))) => {
+                            let pg = PlacedGeometry::new(geom.clone(), (x, y), rotation);
+                            Some(pg.translated_exterior())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
     }
 
-    /// Run a full LBF greedy rollout on the remaining parts, then restore the
-    /// board to its state before the call.
+    /// Snapshot → coarse greedy rollout on remaining parts → restore.
     ///
-    /// Returns `(packing_density, n_placed)`:
-    /// - `packing_density` — `placed_area / bbox_area` after filling in the remaining parts
-    /// - `n_placed` — how many additional parts the greedy rollout managed to place
-    ///
+    /// Uses the coarse grid for speed. Returns `(packing_density, n_placed)`.
     /// Used as a per-step value baseline during RL training.
     pub fn lbf_rollout_value(&mut self) -> (f64, usize) {
         let snap = self.snapshot();
         let remaining = self.remaining_ids();
         let mut n_placed = 0usize;
         for id in &remaining {
-            if let Ok(Some(_)) = self.place(id) {
+            if let Ok(Some(_)) = self.place_fast(id) {
                 n_placed += 1;
             }
         }
@@ -232,14 +295,14 @@ impl Board2D {
         (density, n_placed)
     }
 
-    /// Place all remaining parts via LBF (committing each successful placement).
+    /// Place all remaining parts via the coarse grid (committing each).
     ///
-    /// Returns the number of parts that were successfully placed.
+    /// Used for evaluation baselines. Returns the number placed.
     pub fn lbf_place_all(&mut self) -> usize {
         let remaining = self.remaining_ids();
         let mut n_placed = 0usize;
         for id in &remaining {
-            if let Ok(Some(_)) = self.place(id) {
+            if let Ok(Some(_)) = self.place_fast(id) {
                 n_placed += 1;
             }
         }
@@ -247,9 +310,6 @@ impl Board2D {
     }
 
     /// `placed_area / bbox_area` of all placed parts (0.0 if nothing is placed).
-    ///
-    /// This is the sparrow-style packing density metric: how efficiently the
-    /// parts fill their own bounding box, rather than the full board area.
     pub fn packing_density(&self) -> f64 {
         let bbox = self.bbox_area();
         if bbox == 0.0 {

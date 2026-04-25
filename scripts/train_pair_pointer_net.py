@@ -339,16 +339,18 @@ def _log_training_step(
     stats: dict,
 ) -> None:
     n_placed = env.n_placed()
-    if (episode + 1) % args.log_interval == 0:
-        pos_pct = int(round(stats["advantage_pos_frac"] * 100))
-        print(
-            f"[train] ep={episode+1:>5}/{args.episodes}  "
-            f"placed={n_placed}/{n_parts_ep}  "
-            f"density={reward:.4f}  "
-            f"lbf={stats['n_lbf_placed_init']}({stats['lbf_density_init']:.4f})"
-            f"  adv={stats['advantage_mean']:+.4f}({pos_pct}%↑)"
-            f"  loss={loss.item():.4f}  ent={entropy_bonus.item():.3f}"
-        )
+    pos_pct  = int(round(stats["advantage_pos_frac"] * 100))
+
+    # Single overwriting progress line — one per episode.
+    end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
+    print(
+        f"[train] ep={episode+1:>5}/{args.episodes}  "
+        f"placed={n_placed}/{n_parts_ep}  "
+        f"density={reward:.4f}  lbf={stats['lbf_density_init']:.4f}"
+        f"  adv={stats['advantage_mean']:+.4f}({pos_pct}%+)"
+        f"  loss={loss.item():.4f}",
+        end=end_char, flush=True,
+    )
 
     wandb.log({
         "reward/board_density":     reward,

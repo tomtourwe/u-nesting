@@ -111,6 +111,11 @@ struct ConfigInput {
     crossover_rate: Option<f64>,
     #[serde(default)]
     mutation_rate: Option<f64>,
+    /// Multiplier applied to the placement grid step for rollout/preview operations.
+    /// Larger = faster rollouts, slightly coarser speculative placements.
+    /// Committed place() calls always use the fine grid. Default: 3.0.
+    #[serde(default)]
+    rollout_step_multiplier: Option<f64>,
 }
 
 /// Placement output.
@@ -570,13 +575,18 @@ impl Board2D {
         } else {
             None
         };
+        let multiplier = config_input
+            .as_ref()
+            .and_then(|c| c.rollout_step_multiplier)
+            .unwrap_or(3.0);
         let rust_config = build_config(config_input);
 
         Ok(Self {
-            inner: u_nesting_d2::board::Board2D::new(
+            inner: u_nesting_d2::board::Board2D::new_with_rollout_multiplier(
                 rust_boundary,
                 &rust_geometries,
                 rust_config,
+                multiplier,
             ),
         })
     }
@@ -614,6 +624,18 @@ impl Board2D {
     /// Remove all placed geometries.
     fn reset(&mut self) {
         self.inner.reset();
+    }
+
+    /// Start a new episode using a subset of the board's library.
+    ///
+    /// Clears placed parts and sets the active episode to ``ids``.
+    /// The NFP cache is preserved — episodes after the first benefit from
+    /// cached NFP computations, making training progressively faster.
+    ///
+    /// Args:
+    ///     ids: list of geometry ID strings (must be in the library loaded at construction)
+    fn start_episode(&mut self, ids: Vec<String>) {
+        self.inner.start_episode(&ids);
     }
 
     /// Return a lightweight snapshot of the current board state.
@@ -707,7 +729,7 @@ impl Board2D {
     /// Returns a list of the same length as ``ids``: each element is either
     /// ``[[x, y], …]`` or ``None``.
     fn lbf_preview_all(&self, py: Python<'_>, ids: Vec<String>) -> PyResult<PyObject> {
-        let previews = self.inner.lbf_preview_all(&ids);
+        let previews = py.allow_threads(|| self.inner.lbf_preview_all(&ids));
         // Build a JSON-serialisable value: list of list-of-pairs or null
         let values: Vec<serde_json::Value> = previews
             .into_iter()
@@ -730,8 +752,8 @@ impl Board2D {
     /// Snapshot → greedy LBF rollout on remaining parts → restore.
     ///
     /// Returns ``(packing_density, n_placed)`` as a Python tuple.
-    fn lbf_rollout_value(&mut self) -> (f64, usize) {
-        self.inner.lbf_rollout_value()
+    fn lbf_rollout_value(&mut self, py: Python<'_>) -> (f64, usize) {
+        py.allow_threads(|| self.inner.lbf_rollout_value())
     }
 
     /// Place all remaining parts via LBF (committing each successful placement).
