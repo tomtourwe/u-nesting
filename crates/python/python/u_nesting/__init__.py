@@ -116,6 +116,34 @@ class Board2D:
         """Board-space polygon vertices for every placed part."""
         return self._board.placed_polygons()
 
+    def n_placed(self) -> int:
+        """Number of parts currently placed."""
+        return self._board.n_placed()
+
+    def remaining_ids(self) -> list:
+        """Ordered list of geometry IDs not yet placed this episode."""
+        return self._board.remaining_ids()
+
+    def lbf_preview_all(self, ids: list) -> list:
+        """Speculatively place each id via LBF; return board-space vertices or None."""
+        return self._board.lbf_preview_all(ids)
+
+    def lbf_rollout_value(self) -> tuple:
+        """Snapshot → greedy LBF fill → restore. Returns (packing_density, n_placed)."""
+        return self._board.lbf_rollout_value()
+
+    def lbf_place_all(self) -> int:
+        """Place all remaining parts via LBF. Returns count placed."""
+        return self._board.lbf_place_all()
+
+    def packing_density(self) -> float:
+        """placed_area / bbox_area (0.0 if empty)."""
+        return self._board.packing_density()
+
+    def bbox_area(self) -> float:
+        """Axis-aligned bounding box area of all placed parts."""
+        return self._board.bbox_area()
+
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def board_image(self) -> np.ndarray:
