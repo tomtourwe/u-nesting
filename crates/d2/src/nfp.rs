@@ -1181,28 +1181,26 @@ impl NfpCacheKey {
 #[derive(Debug)]
 pub struct NfpCache {
     cache: RwLock<HashMap<NfpCacheKey, Arc<Nfp>>>,
-    max_size: usize,
+    hits: std::sync::atomic::AtomicUsize,
+    misses: std::sync::atomic::AtomicUsize,
 }
 
 impl NfpCache {
-    /// Creates a new NFP cache with default capacity (1000 entries).
+    /// Creates a new unbounded NFP cache.
     pub fn new() -> Self {
-        Self::with_capacity(1000)
+        Self::with_capacity(usize::MAX)
     }
 
-    /// Creates a new NFP cache with specified capacity.
-    pub fn with_capacity(max_size: usize) -> Self {
+    /// Creates a new NFP cache (capacity is ignored — kept for API compat).
+    pub fn with_capacity(_max_size: usize) -> Self {
         Self {
             cache: RwLock::new(HashMap::new()),
-            max_size,
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            misses: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Gets a cached NFP or computes and caches it.
-    ///
-    /// # Arguments
-    /// * `key` - Tuple of (geometry_id_a, geometry_id_b, rotation_in_radians)
-    /// * `compute` - Function to compute the NFP if not cached
     pub fn get_or_compute<F>(&self, key: (&str, &str, f64), compute: F) -> Result<Arc<Nfp>>
     where
         F: FnOnce() -> Result<Nfp>,
@@ -1215,11 +1213,13 @@ impl NfpCache {
                 Error::Internal(format!("Failed to acquire cache read lock: {}", e))
             })?;
             if let Some(nfp) = cache.get(&cache_key) {
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(Arc::clone(nfp));
             }
         }
 
         // Compute the NFP
+        self.misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nfp = Arc::new(compute()?);
 
         // Store in cache (write lock)
@@ -1227,20 +1227,18 @@ impl NfpCache {
             let mut cache = self.cache.write().map_err(|e| {
                 Error::Internal(format!("Failed to acquire cache write lock: {}", e))
             })?;
-
-            // Simple eviction: if at capacity, clear half the cache
-            if cache.len() >= self.max_size {
-                let keys_to_remove: Vec<_> =
-                    cache.keys().take(self.max_size / 2).cloned().collect();
-                for key in keys_to_remove {
-                    cache.remove(&key);
-                }
-            }
-
             cache.insert(cache_key, Arc::clone(&nfp));
         }
 
         Ok(nfp)
+    }
+
+    /// Returns `(hits, misses, size)`.
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let hits   = self.hits.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = self.misses.load(std::sync::atomic::Ordering::Relaxed);
+        let size   = self.cache.read().map(|c| c.len()).unwrap_or(0);
+        (hits, misses, size)
     }
 
     /// Returns the number of cached entries.

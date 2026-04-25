@@ -763,6 +763,11 @@ impl Board2D {
         self.inner.place_remaining()
     }
 
+    /// NFP cache statistics as ``(hits, misses, size)``.
+    fn cache_stats(&self) -> (usize, usize, usize) {
+        self.inner.cache_stats()
+    }
+
     /// ``placed_area / bbox_area`` of all placed parts (0.0 if nothing placed).
     fn packing_density(&self) -> f64 {
         self.inner.packing_density()

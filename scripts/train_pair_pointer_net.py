@@ -354,6 +354,10 @@ def _log_training_step(
         end=end_char, flush=True,
     )
 
+    hits, misses, cache_size = env._board._board.cache_stats()
+    total = hits + misses
+    hit_rate = hits / total if total > 0 else 0.0
+
     wandb.log({
         "agent/density":        reward,
         "agent/parts_placed":   n_placed / n_parts_ep,
@@ -362,6 +366,9 @@ def _log_training_step(
         "greedy/parts_placed":  n_rollout / n_parts_ep,
         "loss/total":           loss.item(),
         "perf/episode_time_s":  episode_time,
+        "cache/hit_rate":       hit_rate,
+        "cache/size":           cache_size,
+        "cache/misses":         misses,
     }, step=episode + 1)
 
 

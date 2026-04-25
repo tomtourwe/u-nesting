@@ -61,6 +61,11 @@ impl Nester2D {
         Self::new(Config::default())
     }
 
+    /// Returns NFP cache statistics: `(hits, misses, size)`.
+    pub fn cache_stats(&self) -> (usize, usize, usize) {
+        self.nfp_cache.stats()
+    }
+
     /// Bottom-Left Fill algorithm implementation with rotation optimization.
     fn bottom_left_fill(
         &self,

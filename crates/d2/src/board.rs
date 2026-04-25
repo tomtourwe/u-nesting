@@ -319,6 +319,11 @@ impl Board2D {
         n_placed
     }
 
+    /// Returns NFP cache statistics: `(hits, misses, size)`.
+    pub fn cache_stats(&self) -> (usize, usize, usize) {
+        self.nester.cache_stats()
+    }
+
     /// `placed_area / bbox_area` of all placed parts (0.0 if nothing is placed).
     pub fn packing_density(&self) -> f64 {
         let bbox = self.bbox_area();
