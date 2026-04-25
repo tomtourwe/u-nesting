@@ -85,11 +85,11 @@ def _sample_action(
     pair_images_t: torch.Tensor,
     mask: torch.Tensor,
     greedy: bool,
-) -> tuple[torch.Tensor, Categorical]:
+) -> tuple[torch.Tensor, Categorical, torch.Tensor]:
     part_logits = model(pair_images_t, mask)
     part_dist   = Categorical(logits=part_logits)
     part_id     = part_logits.argmax() if greedy else part_dist.sample()
-    return part_id, part_dist
+    return part_id, part_dist, part_logits
 
 
 def _action_log_prob_and_entropy(
@@ -101,6 +101,23 @@ def _action_log_prob_and_entropy(
 
 def _td_advantage(R_t: float, v_curr: float, v_next: float, gamma: float) -> float:
     return R_t + gamma * v_next - v_curr
+
+
+def _polygon_area(polygon: list) -> float:
+    """Signed shoelace area (absolute value returned)."""
+    n = len(polygon)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += polygon[i][0] * polygon[j][1]
+        area -= polygon[j][0] * polygon[i][1]
+    return abs(area) / 2.0
+
+
+def _greedy_target(env: "UNestingGymEnv", remaining: list[int]) -> int:
+    """Episode ID of the largest remaining part by polygon area."""
+    episode_geoms = env._episode_geoms()
+    return max(remaining, key=lambda ep_id: _polygon_area(episode_geoms[ep_id]["polygon"]))
 
 
 def _run_episode(
@@ -141,7 +158,7 @@ def _run_episode(
         mask          = _build_remaining_mask(remaining, n_parts, device)
         pair_images_t = torch.from_numpy(env.preview_pair_images()).to(device)
 
-        part_id, part_dist = _sample_action(model, pair_images_t, mask, greedy)
+        part_id, part_dist, _ = _sample_action(model, pair_images_t, mask, greedy)
 
         success = env.place_anywhere(part_id.item())
         if not success:
@@ -152,7 +169,9 @@ def _run_episode(
             lp, ent = _action_log_prob_and_entropy(part_dist, part_id)
             log_probs.append(lp)
             entropies.append(ent)
-            observations.append((pair_images_t.cpu(), mask.cpu(), part_id.cpu()))
+            gt = _greedy_target(env, remaining)
+            observations.append((pair_images_t.cpu(), mask.cpu(), part_id.cpu(),
+                                  torch.tensor(gt)))
 
         R_t = env.packing_density() - prev_density
         prev_density = env.packing_density()
@@ -218,14 +237,21 @@ def _current_entropy_coef(episode: int, args: argparse.Namespace) -> float:
     return args.entropy_coef
 
 
+def _current_imitation_coef(episode: int, args: argparse.Namespace) -> float:
+    if args.imitation_coef <= 0.0:
+        return 0.0
+    t = min(1.0, episode / args.imitation_episodes)
+    return args.imitation_coef * (1.0 - t)
+
+
 def _evaluate_actions(
     model: torch.nn.Module,
     observations: list[tuple],
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, entropies = [], []
-    for pair_images_t, mask, part_id in observations:
-        _, dist = _sample_action(
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    log_probs, entropies, imitation_losses = [], [], []
+    for pair_images_t, mask, part_id, greedy_target in observations:
+        logits, dist = _sample_action(
             model,
             pair_images_t.to(device),
             mask.to(device),
@@ -233,15 +259,20 @@ def _evaluate_actions(
         )
         log_probs.append(dist.log_prob(part_id.to(device)))
         entropies.append(dist.entropy())
-    return log_probs, entropies
+        imitation_losses.append(
+            F.cross_entropy(logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device))
+        )
+    return log_probs, entropies, imitation_losses
 
 
 def _ppo_loss(
     old_log_probs: list[torch.Tensor],
     new_log_probs: list[torch.Tensor],
     entropies: list[torch.Tensor],
+    imitation_losses: list[torch.Tensor],
     advantages: list[float],
     entropy_coef: float,
+    imitation_coef: float,
     n_parts: int,
     clip_eps: float,
     device: torch.device,
@@ -253,8 +284,9 @@ def _ppo_loss(
     clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
     policy_loss   = -torch.min(ratio * adv, clipped * adv).mean()
     entropy_bonus = torch.stack(entropies).mean() / math.log(n_parts)
-    total = policy_loss - entropy_coef * entropy_bonus
-    return total, entropy_bonus
+    imitation_loss = torch.stack(imitation_losses).mean()
+    total = policy_loss - entropy_coef * entropy_bonus + imitation_coef * imitation_loss
+    return total, entropy_bonus, imitation_loss
 
 
 def _run_greedy_eval(
@@ -344,7 +376,8 @@ def _log_training_step(
     reward: float,
     loss: torch.Tensor,
     entropy_bonus: torch.Tensor,
-    entropy_coef: float,
+    imitation_loss: torch.Tensor,
+    imitation_coef: float,
     stats: dict,
     episode_time: float,
 ) -> None:
@@ -358,7 +391,9 @@ def _log_training_step(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
         f"density={reward:.4f}  greedy={greedy_d:.4f}  vs_greedy={vs_greedy:+.3f}"
-        f"  loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}  t={episode_time:.1f}s",
+        f"  loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}"
+        f"  imit={imitation_loss.item():.4f}({imitation_coef:.2f})"
+        f"  t={episode_time:.1f}s",
         end=end_char, flush=True,
     )
 
@@ -378,6 +413,8 @@ def _log_training_step(
         "greedy/parts_placed":      n_rollout / n_parts_ep,
         "loss/total":               loss.item(),
         "loss/entropy":             entropy_bonus.item(),
+        "loss/imitation":           imitation_loss.item(),
+        "loss/imitation_coef":      imitation_coef,
         "perf/episode_time_s":      episode_time,
         "cache/hit_rate":           ep_hit_rate,
         "cache/misses_per_episode": ep_misses,
@@ -488,6 +525,8 @@ def train(args: argparse.Namespace) -> None:
         args.n_parts_start = args.n_parts
     if args.curriculum_episodes is None:
         args.curriculum_episodes = args.episodes
+    if args.imitation_episodes is None:
+        args.imitation_episodes = args.curriculum_episodes
     if args.out_best is None:
         args.out_best = f"data/{args.model}_pointer_net_best.pt"
     if args.out_last is None:
@@ -535,15 +574,17 @@ def train(args: argparse.Namespace) -> None:
             value_interval=args.value_interval,
         )
 
-        entropy_coef = _current_entropy_coef(episode, args)
+        entropy_coef   = _current_entropy_coef(episode, args)
+        imitation_coef = _current_imitation_coef(episode, args)
 
         if log_probs:
             old_log_probs = [lp.detach() for lp in log_probs]
             for _ in range(args.ppo_epochs):
-                new_log_probs, new_entropies = _evaluate_actions(model, observations, device)
-                loss, entropy_bonus = _ppo_loss(
-                    old_log_probs, new_log_probs, new_entropies,
-                    advantages, entropy_coef, n_parts_ep, args.ppo_clip, device,
+                new_log_probs, new_entropies, new_imitation = _evaluate_actions(
+                    model, observations, device)
+                loss, entropy_bonus, imitation_loss = _ppo_loss(
+                    old_log_probs, new_log_probs, new_entropies, new_imitation,
+                    advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
                 )
                 if torch.isfinite(loss):
                     optimizer.zero_grad(set_to_none=True)
@@ -554,11 +595,11 @@ def train(args: argparse.Namespace) -> None:
                     loss = torch.tensor(0.0)
                     break
         else:
-            loss = entropy_bonus = torch.tensor(0.0)
+            loss = entropy_bonus = imitation_loss = torch.tensor(0.0)
 
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
-                           entropy_coef, stats, episode_time)
+                           imitation_loss, imitation_coef, stats, episode_time)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(env, model, eval_configs, device, args, episode)
@@ -603,6 +644,10 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",            type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
+    p.add_argument("--imitation-coef",        type=float, default=0.3,
+                   help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
+    p.add_argument("--imitation-episodes",   type=int,   default=None,
+                   help="Episodes over which imitation coef decays to 0 (default: curriculum_episodes).")
     p.add_argument("--value-interval",       type=int,   default=3,
                    help="Call rollout_value() every N steps; reuse last value in between (default 3).")
     p.add_argument("--rotations",           type=float, nargs="+", default=None,
