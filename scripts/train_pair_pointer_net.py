@@ -111,6 +111,7 @@ def _run_episode(
     greedy: bool = False,
     gamma: float = 0.99,
     capture_snapshots: bool = False,
+    value_interval: int = 1,
 ) -> tuple[list, list, list[float], float, list, dict, list]:
     env.reset(lib_ids)
     n_parts = len(lib_ids)
@@ -128,6 +129,7 @@ def _run_episode(
     rollout_density_init = rollout_density_curr
     n_rollout_placed_init = n_rollout_curr
     prev_density         = env.packing_density()
+    step                 = 0
 
     skip_ids: set[int] = set()
 
@@ -156,12 +158,18 @@ def _run_episode(
         prev_density = env.packing_density()
         R_t_list.append(R_t)
 
-        rollout_density_next, n_rollout_next = env.rollout_value()
-        v_next = rollout_density_next
-        A_t    = _td_advantage(R_t, v_curr, v_next, gamma)
+        if step % value_interval == 0:
+            rollout_density_next, n_rollout_next = env.rollout_value()
+            v_next = rollout_density_next
+            n_rollout_curr = n_rollout_next
+        else:
+            v_next = v_curr  # reuse last known value
+
+        A_t = _td_advantage(R_t, v_curr, v_next, gamma)
         A_t_list.append(A_t)
         v_rollout_list.append(v_next)
-        v_curr, n_rollout_curr = v_next, n_rollout_next
+        v_curr = v_next
+        step  += 1
 
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
@@ -524,6 +532,7 @@ def train(args: argparse.Namespace) -> None:
         model.train()
         log_probs, entropies, advantages, reward, _, stats, observations = _run_episode(
             env, model, lib_ids, device, gamma=args.gamma,
+            value_interval=args.value_interval,
         )
 
         entropy_coef = _current_entropy_coef(episode, args)
@@ -594,6 +603,8 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",            type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
+    p.add_argument("--value-interval",       type=int,   default=3,
+                   help="Call rollout_value() every N steps; reuse last value in between (default 3).")
     p.add_argument("--rotations",           type=float, nargs="+", default=None,
                    metavar="DEG",
                    help="Allowed rotation angles in degrees for all parts "
