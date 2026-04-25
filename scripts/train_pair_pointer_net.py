@@ -338,34 +338,27 @@ def _log_training_step(
     entropy_coef: float,
     stats: dict,
 ) -> None:
-    n_placed = env.n_placed()
-    pos_pct  = int(round(stats["advantage_pos_frac"] * 100))
-
-    # Single overwriting progress line — one per episode.
-    end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
+    n_placed  = env.n_placed()
     n_rollout = stats["n_rollout_placed_init"]
+    greedy_d  = stats["rollout_density_init"]
+    vs_greedy = reward / greedy_d if greedy_d > 0 else float("nan")
+
+    end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
     print(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
-        f"density={reward:.4f}  rollout={stats['rollout_density_init']:.4f}"
-        f"  adv={stats['advantage_mean']:+.4f}({pos_pct}%+)"
+        f"density={reward:.4f}  greedy={greedy_d:.4f}  vs_greedy={vs_greedy:+.3f}"
         f"  loss={loss.item():.4f}",
         end=end_char, flush=True,
     )
 
     wandb.log({
-        "reward/board_density":      reward,
-        "loss/total":                loss.item(),
-        "loss/entropy_bonus":        entropy_bonus.item(),
-        "train/R_t_mean":            stats["R_t_mean"],
-        "train/bbox_frac":           stats["bbox_frac"],
-        "rollout/density_init":      stats["rollout_density_init"],
-        "rollout/n_placed_init":     stats["n_rollout_placed_init"],
-        "rollout/v_final":           stats["v_rollout_final"],
-        "train/advantage_mean":      stats["advantage_mean"],
-        "train/advantage_pos_frac":  stats["advantage_pos_frac"],
-        "train/rollout_gap":         stats["R_t_mean"] - stats["advantage_mean"],
-        "episode":                   episode + 1,
+        "agent/density":        reward,
+        "agent/parts_placed":   n_placed / n_parts_ep,
+        "agent/vs_greedy":      vs_greedy,
+        "greedy/density":       greedy_d,
+        "greedy/parts_placed":  n_rollout / n_parts_ep,
+        "loss/total":           loss.item(),
     }, step=episode + 1)
 
 
@@ -435,9 +428,9 @@ def _log_eval_set(
     mean_agent         = float(np.mean(agent_densities))
     mean_greedy        = float(np.mean(greedy_densities))
 
-    print(f"  ratio={mean_ratio:.3f}±{std_ratio:.3f} max={max_ratio:.3f} ({pct_above}%>1)"
-          f"  mean_density={mean_agent:.4f}  mean_greedy={mean_greedy:.4f}"
-          f"  mean_placed={mean_placed:.1f} vs greedy={mean_greedy_placed:.1f}/{len(plot_lib_ids)}")
+    print(f"  agent={mean_agent:.4f}  greedy={mean_greedy:.4f}  vs_greedy={mean_ratio:.3f}"
+          f"  beat_greedy={pct_above}%"
+          f"  placed={mean_placed:.1f} vs greedy={mean_greedy_placed:.1f}/{len(plot_lib_ids)}")
 
     fig_best = _make_eval_figure(
         plot_snapshots, plot_n_placed, plot_lib_ids, episode, args,
@@ -448,15 +441,12 @@ def _log_eval_set(
         worst_greedy_polys, worst_n_greedy, worst_greedy_density, worst_unplaced_polys,
     )
     wandb.log({
-        "eval/board_best":           wandb.Image(fig_best),
-        "eval/board_worst":          wandb.Image(fig_worst),
-        "eval/ratio_mean":           mean_ratio,
-        "eval/ratio_std":            std_ratio,
-        "eval/ratio_max":            max_ratio,
-        "eval/pct_above_greedy":     pct_above,
-        "eval/density_mean":         mean_agent,
-        "eval/greedy_density_mean":  mean_greedy,
-        "eval/placed_mean":          mean_placed,
+        "eval/board_best":       wandb.Image(fig_best),
+        "eval/board_worst":      wandb.Image(fig_worst),
+        "eval/agent_density":    mean_agent,
+        "eval/greedy_density":   mean_greedy,
+        "eval/vs_greedy":        mean_ratio,
+        "eval/beat_greedy_pct":  pct_above,
     }, step=episode + 1)
     plt.close(fig_best)
     plt.close(fig_worst)
