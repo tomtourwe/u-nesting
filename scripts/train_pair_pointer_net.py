@@ -350,7 +350,7 @@ def _log_training_step(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
         f"density={reward:.4f}  greedy={greedy_d:.4f}  vs_greedy={vs_greedy:+.3f}"
-        f"  loss={loss.item():.4f}  t={episode_time:.1f}s",
+        f"  loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}  t={episode_time:.1f}s",
         end=end_char, flush=True,
     )
 
@@ -363,16 +363,17 @@ def _log_training_step(
     _log_training_step._prev_hits   = hits
 
     wandb.log({
-        "agent/density":           reward,
-        "agent/parts_placed":      n_placed / n_parts_ep,
-        "agent/vs_greedy":         vs_greedy,
-        "greedy/density":          greedy_d,
-        "greedy/parts_placed":     n_rollout / n_parts_ep,
-        "loss/total":              loss.item(),
-        "perf/episode_time_s":     episode_time,
-        "cache/hit_rate":          ep_hit_rate,
+        "agent/density":            reward,
+        "agent/parts_placed":       n_placed / n_parts_ep,
+        "agent/vs_greedy":          vs_greedy,
+        "greedy/density":           greedy_d,
+        "greedy/parts_placed":      n_rollout / n_parts_ep,
+        "loss/total":               loss.item(),
+        "loss/entropy":             entropy_bonus.item(),
+        "perf/episode_time_s":      episode_time,
+        "cache/hit_rate":           ep_hit_rate,
         "cache/misses_per_episode": ep_misses,
-        "cache/size":              cache_size,
+        "cache/size":               cache_size,
     }, step=episode + 1)
 
 _log_training_step._prev_misses = 0
