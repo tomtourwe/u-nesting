@@ -71,9 +71,15 @@ class UNestingGymEnv:
         if isinstance(raw, list):
             self._library: list[dict] = raw
         elif isinstance(raw, dict) and "items" in raw:
-            # Convert sparrow format — orientations come from CLI, not the library
+            # Convert sparrow format.  Map allowed_orientations → rotations so the
+            # Rust engine sees the library's orientation constraints even when no
+            # CLI --rotations override is given (greedy baseline, rollout_value, etc.)
             self._library = [
-                {"id": item.get("label", str(i)), "polygon": item["shape"]["data"]}
+                {
+                    "id": item.get("label", str(i)),
+                    "polygon": item["shape"]["data"],
+                    "rotations": item.get("allowed_orientations", []),
+                }
                 for i, item in enumerate(raw["items"])
             ]
         else:
@@ -149,6 +155,96 @@ class UNestingGymEnv:
         """
         geom_id = self._episode_geoms()[episode_id]["id"]
         return self._board.place(geom_id) is not None
+
+    def place_with_rotation(self, episode_id: int, rotation_rad: float) -> bool:
+        """
+        Place part `episode_id` at the agent-specified rotation (radians).
+
+        The NFP engine finds the best (x, y) for that rotation only.
+        Returns True if placed, False if the part doesn't fit at that rotation.
+        """
+        geom_id = self._episode_geoms()[episode_id]["id"]
+        return self._board.place_with_rotation(geom_id, rotation_rad) is not None
+
+    def get_rotation_angles(self, n_rotations: int = 8) -> list[float]:
+        """Return `n_rotations` evenly-spaced angles in [0, 2π)."""
+        import math
+        return [2 * math.pi * r / n_rotations for r in range(n_rotations)]
+
+    def preview_images_per_rotation(self, rotations_rad: list[float]) -> np.ndarray:
+        """
+        Build (N, R+1, IMG_SIZE, IMG_SIZE) observation images.
+
+        Channel 0      : current board SDF (same for all N parts).
+        Channels 1..R+1: hypothetical board SDF after placing part i at
+                         rotation rotations_rad[r].  Falls back to the current
+                         SDF if the part is already placed or doesn't fit at
+                         that rotation.
+
+        Uses the same min-distance EDT trick as preview_pair_images:
+        EDT runs once on the base board and once per (part, rotation) candidate.
+
+        Args:
+            rotations_rad: list of R rotation angles in radians.
+
+        Returns:
+            np.ndarray of shape (N, R+1, IMG_SIZE, IMG_SIZE), dtype float32.
+        """
+        from scipy.ndimage import distance_transform_edt
+
+        R             = len(rotations_rad)
+        N             = len(self._episode_geoms())
+        IMG           = self.IMG_SIZE
+        remaining_eps = self.remaining_item_ids()
+        episode_geoms = self._episode_geoms()
+
+        # ── base canvas + board SDF ────────────────────────────────────────
+        base_canvas = np.zeros((IMG, IMG), dtype=bool)
+        for verts_board in self._board.placed_polygons():
+            verts_px = [(x * self._sx, y * self._sy) for x, y in verts_board]
+            base_canvas |= _rasterize_polygon(verts_px, IMG)
+
+        if base_canvas.any():
+            base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
+            current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+        else:
+            base_dist   = np.full((IMG, IMG), np.inf, dtype=np.float32)
+            current_sdf = np.ones((IMG, IMG), dtype=np.float32)
+
+        # ── batch Rust preview for remaining parts × all rotations ─────────
+        remaining_set = set(remaining_eps)
+        flat_ids:  list[str]   = []
+        flat_rots: list[float] = []
+        for ep in range(N):
+            if ep in remaining_set:
+                gid = episode_geoms[ep]["id"]
+                flat_ids.extend([gid] * R)
+            else:
+                flat_ids.extend(["__skip__"] * R)
+            flat_rots.extend(rotations_rad)
+
+        raw = self._board.preview_all_per_rotation(flat_ids, flat_rots)  # N×R entries
+
+        # ── assemble result tensor ─────────────────────────────────────────
+        result = np.empty((N, R + 1, IMG, IMG), dtype=np.float32)
+        result[:, 0] = current_sdf
+
+        for ep in range(N):
+            for r_idx in range(R):
+                verts_board = raw[ep * R + r_idx]
+                if verts_board is None or ep not in remaining_set:
+                    result[ep, r_idx + 1] = current_sdf
+                else:
+                    verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
+                    part_canvas = _rasterize_polygon(verts_px, IMG)
+                    part_dist   = distance_transform_edt(~part_canvas).astype(np.float32)
+                    result_dist = np.minimum(base_dist, part_dist)
+                    result_dist[base_canvas | part_canvas] = 0.0
+                    result[ep, r_idx + 1] = (
+                        np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+                    )
+
+        return result
 
     def rollout_value(self) -> tuple[float, int]:
         """

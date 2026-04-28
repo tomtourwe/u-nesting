@@ -138,6 +138,14 @@ class Board2D:
         """Speculatively place each id (no commit); return board-space vertices or None."""
         return self._board.preview_all(ids)
 
+    def place_with_rotation(self, geometry_id: str, rotation_rad: float) -> dict | None:
+        """Place part at a fixed rotation; NFP finds best (x, y). Returns placement dict or None."""
+        return self._board.place_with_rotation(geometry_id, rotation_rad)
+
+    def preview_all_per_rotation(self, ids: list, rotations_rad: list) -> list:
+        """Speculatively place each (id, rotation) pair (no commit); return board-space vertices or None."""
+        return self._board.preview_all_per_rotation(ids, rotations_rad)
+
     def rollout_value(self) -> tuple:
         """Snapshot → greedy fill of remaining parts → restore. Returns (packing_density, n_placed)."""
         return self._board.rollout_value()

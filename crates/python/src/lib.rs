@@ -723,6 +723,67 @@ impl Board2D {
         self.inner.remaining_ids()
     }
 
+    /// Place part ``geometry_id`` at a fixed ``rotation_rad`` using the fine grid.
+    ///
+    /// The NFP engine finds the best (x, y) for that rotation only.
+    /// Returns a placement dict or ``None`` if the part doesn't fit.
+    fn place_with_rotation(
+        &mut self,
+        py: Python<'_>,
+        geometry_id: &str,
+        rotation_rad: f64,
+    ) -> PyResult<PyObject> {
+        match self
+            .inner
+            .place_with_rotation(geometry_id, rotation_rad)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?
+        {
+            Some(info) => {
+                let d = serde_json::json!({
+                    "geometry_id": info.geometry_id,
+                    "position": [info.x, info.y],
+                    "rotation": info.rotation,
+                });
+                let json_str = serde_json::to_string(&d)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                let result = py.import("json")?.call_method1("loads", (json_str,))?;
+                Ok(result.into())
+            }
+            None => Ok(py.None()),
+        }
+    }
+
+    /// For each ``(id, rotation_rad)`` pair, speculatively place the part at
+    /// that rotation (no commit) and return board-space vertices or ``None``.
+    ///
+    /// ``ids`` and ``rotations_rad`` are parallel lists of the same length (N×R).
+    /// Returns a list of the same length: each element is ``[[x, y], …]`` or ``None``.
+    fn preview_all_per_rotation(
+        &self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        rotations_rad: Vec<f64>,
+    ) -> PyResult<PyObject> {
+        let previews =
+            py.allow_threads(|| self.inner.preview_all_per_rotation(&ids, &rotations_rad));
+        let values: Vec<serde_json::Value> = previews
+            .into_iter()
+            .map(|opt| match opt {
+                Some(verts) => serde_json::Value::Array(
+                    verts
+                        .into_iter()
+                        .map(|(x, y)| serde_json::json!([x, y]))
+                        .collect(),
+                ),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        let json_str = serde_json::to_string(&values)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let result = py.import("json")?.call_method1("loads", (json_str,))?;
+        Ok(result.into())
+    }
+
     /// For each id in ``ids``, speculatively place it (no commit) and return
     /// the board-space polygon vertices, or ``None`` if it doesn't fit.
     ///

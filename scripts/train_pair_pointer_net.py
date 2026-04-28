@@ -82,21 +82,49 @@ def _build_remaining_mask(remaining_ids: list[int], n_parts: int, device: torch.
 
 def _sample_action(
     model: torch.nn.Module,
-    pair_images_t: torch.Tensor,
+    obs_t: torch.Tensor,
     mask: torch.Tensor,
     greedy: bool,
-) -> tuple[torch.Tensor, Categorical, torch.Tensor]:
-    part_logits = model(pair_images_t, mask)
-    part_dist   = Categorical(logits=part_logits)
-    part_id     = part_logits.argmax() if greedy else part_dist.sample()
-    return part_id, part_dist, part_logits
+) -> tuple:
+    """
+    Sample a (part, rotation) action from the model.
+
+    Returns (part_id, part_dist, part_logits, rot_id, rot_dist).
+    rot_id / rot_dist are None when the model does not have a rotation_head
+    (e.g. SpatialPointerNet).
+    """
+    output = model(obs_t, mask)
+    if isinstance(output, tuple):
+        part_logits, rot_feats, ctx = output
+    else:
+        part_logits, rot_feats, ctx = output, None, None
+
+    part_dist = Categorical(logits=part_logits)
+    part_id   = part_logits.argmax() if greedy else part_dist.sample()
+
+    rot_id = rot_dist = None
+    if rot_feats is not None and hasattr(model, "rotation_head"):
+        rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
+        rot_dist   = Categorical(logits=rot_logits)
+        rot_id     = rot_logits.argmax() if greedy else rot_dist.sample()
+
+    return part_id, part_dist, part_logits, rot_id, rot_dist
 
 
 def _action_log_prob_and_entropy(
     part_dist: Categorical,
     part_id: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return part_dist.log_prob(part_id), part_dist.entropy()
+    rot_dist: Categorical | None = None,
+    rot_id: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Returns (joint_log_prob, part_entropy, rot_entropy_or_None)."""
+    lp      = part_dist.log_prob(part_id)
+    ent     = part_dist.entropy()
+    rot_ent = None
+    if rot_dist is not None and rot_id is not None:
+        lp      = lp + rot_dist.log_prob(rot_id)
+        rot_ent = rot_dist.entropy()
+    return lp, ent, rot_ent
 
 
 def _td_advantage(R_t: float, v_curr: float, v_next: float, gamma: float) -> float:
@@ -129,17 +157,19 @@ def _run_episode(
     gamma: float = 0.99,
     capture_snapshots: bool = False,
     value_interval: int = 1,
-) -> tuple[list, list, list[float], float, list, dict, list]:
+    rotations_rad: list[float] | None = None,
+) -> tuple[list, list, list, list[float], float, list, dict, list]:
     env.reset(lib_ids)
     n_parts = len(lib_ids)
 
-    log_probs:    list[torch.Tensor] = []
-    entropies:    list[torch.Tensor] = []
-    observations: list[tuple]        = []
-    snapshots:    list               = []
-    R_t_list:     list[float]        = []
-    A_t_list:     list[float]        = []
-    v_rollout_list: list[float]      = []
+    log_probs:      list[torch.Tensor] = []
+    entropies:      list[torch.Tensor] = []
+    rot_entropies:  list[torch.Tensor] = []
+    observations:   list[tuple]        = []
+    snapshots:      list               = []
+    R_t_list:       list[float]        = []
+    A_t_list:       list[float]        = []
+    v_rollout_list: list[float]        = []
 
     rollout_density_curr, n_rollout_curr = env.rollout_value()
     v_curr               = rollout_density_curr
@@ -155,23 +185,38 @@ def _run_episode(
         if not remaining:
             break
 
-        mask          = _build_remaining_mask(remaining, n_parts, device)
-        pair_images_t = torch.from_numpy(env.preview_pair_images()).to(device)
+        mask = _build_remaining_mask(remaining, n_parts, device)
 
-        part_id, part_dist, _ = _sample_action(model, pair_images_t, mask, greedy)
+        if rotations_rad is not None:
+            obs_np = env.preview_images_per_rotation(rotations_rad)
+        else:
+            obs_np = env.preview_pair_images()
+        obs_t = torch.from_numpy(obs_np).to(device)
 
-        success = env.place_anywhere(part_id.item())
+        part_id, part_dist, _, rot_id, rot_dist = _sample_action(model, obs_t, mask, greedy)
+
+        if rotations_rad is not None and rot_id is not None:
+            success = env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
+        else:
+            success = env.place_anywhere(part_id.item())
+
         if not success:
             skip_ids.add(part_id.item())
             continue
 
         if not greedy:
-            lp, ent = _action_log_prob_and_entropy(part_dist, part_id)
+            lp, ent, rot_ent = _action_log_prob_and_entropy(
+                part_dist, part_id, rot_dist, rot_id)
             log_probs.append(lp)
             entropies.append(ent)
+            if rot_ent is not None:
+                rot_entropies.append(rot_ent)
             gt = _greedy_target(env, remaining)
-            observations.append((pair_images_t.cpu(), mask.cpu(), part_id.cpu(),
-                                  torch.tensor(gt)))
+            observations.append((
+                obs_t.cpu(), mask.cpu(), part_id.cpu(),
+                rot_id.cpu() if rot_id is not None else None,
+                torch.tensor(gt),
+            ))
 
         R_t = env.packing_density() - prev_density
         prev_density = env.packing_density()
@@ -206,10 +251,15 @@ def _run_episode(
         "bbox_frac":             env.bbox_area() / board_area,
     }
 
-    return log_probs, entropies, A_t_list, episode_reward, snapshots, stats, observations
+    return log_probs, entropies, rot_entropies, A_t_list, episode_reward, snapshots, stats, observations
 
 
 def _build_env(args: argparse.Namespace) -> UNestingGymEnv:
+    if args.plate_width <= 150 or args.plate_height <= 150:
+        print(
+            f"[warn] plate {args.plate_width:.0f}×{args.plate_height:.0f} mm is very small. "
+            "Aligner parts are ~50 mm wide; use e.g. --plate-width 280 --plate-height 200."
+        )
     return UNestingGymEnv(
         args.json,
         plate_width=args.plate_width,
@@ -248,21 +298,35 @@ def _evaluate_actions(
     model: torch.nn.Module,
     observations: list[tuple],
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, entropies, imitation_losses = [], [], []
-    for pair_images_t, mask, part_id, greedy_target in observations:
-        logits, dist = _sample_action(
-            model,
-            pair_images_t.to(device),
-            mask.to(device),
-            greedy=False,
-        )
-        log_probs.append(dist.log_prob(part_id.to(device)))
-        entropies.append(dist.entropy())
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    log_probs, part_entropies, rot_entropies, imitation_losses = [], [], [], []
+    for obs_entry in observations:
+        obs_t, mask, part_id, rot_id, greedy_target = obs_entry
+        obs_t    = obs_t.to(device)
+        mask     = mask.to(device)
+        part_id  = part_id.to(device)
+
+        output = model(obs_t, mask)
+        if isinstance(output, tuple):
+            part_logits, rot_feats, ctx = output
+        else:
+            part_logits, rot_feats, ctx = output, None, None
+
+        part_dist = Categorical(logits=part_logits)
+        lp        = part_dist.log_prob(part_id)
+        part_entropies.append(part_dist.entropy())
+
+        if rot_feats is not None and rot_id is not None and hasattr(model, "rotation_head"):
+            rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
+            rot_dist   = Categorical(logits=rot_logits)
+            lp         = lp + rot_dist.log_prob(rot_id.to(device))
+            rot_entropies.append(rot_dist.entropy())
+
+        log_probs.append(lp)
         imitation_losses.append(
-            F.cross_entropy(logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device))
+            F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device))
         )
-    return log_probs, entropies, imitation_losses
+    return log_probs, part_entropies, rot_entropies, imitation_losses
 
 
 def _ppo_loss(
@@ -276,17 +340,24 @@ def _ppo_loss(
     n_parts: int,
     clip_eps: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    rot_entropies: list[torch.Tensor] | None = None,
+    rot_entropy_coef: float = 0.0,
+    n_rotations: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     adv     = torch.tensor(advantages, dtype=torch.float32, device=device)
     old_lp  = torch.stack(old_log_probs).detach()
     new_lp  = torch.stack(new_log_probs)
     ratio   = (new_lp - old_lp).exp()
     clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
-    policy_loss   = -torch.min(ratio * adv, clipped * adv).mean()
-    entropy_bonus = torch.stack(entropies).mean() / math.log(n_parts)
+    policy_loss    = -torch.min(ratio * adv, clipped * adv).mean()
+    part_entropy   = torch.stack(entropies).mean() / math.log(max(n_parts, 2))
     imitation_loss = torch.stack(imitation_losses).mean()
-    total = policy_loss - entropy_coef * entropy_bonus + imitation_coef * imitation_loss
-    return total, entropy_bonus, imitation_loss
+    total = policy_loss - entropy_coef * part_entropy + imitation_coef * imitation_loss
+    rot_entropy = torch.tensor(0.0, device=device)
+    if rot_entropies:
+        rot_entropy = torch.stack(rot_entropies).mean() / math.log(max(n_rotations, 2))
+        total = total - rot_entropy_coef * rot_entropy
+    return total, part_entropy, imitation_loss, rot_entropy
 
 
 def _run_greedy_eval(
@@ -295,12 +366,14 @@ def _run_greedy_eval(
     eval_lib_ids: list[int],
     device: torch.device,
     args: argparse.Namespace,
+    rotations_rad: list[float] | None = None,
 ) -> tuple[float, list, int, list]:
     model.eval()
     with torch.no_grad():
-        _, _, _, eval_density, eval_snapshots, _, _ = _run_episode(
+        _, _, _, _, eval_density, eval_snapshots, _, _ = _run_episode(
             env, model, eval_lib_ids, device,
             greedy=True, gamma=args.gamma, capture_snapshots=True,
+            rotations_rad=rotations_rad,
         )
     model.train()
     remaining      = env.remaining_item_ids()
@@ -380,6 +453,7 @@ def _log_training_step(
     imitation_coef: float,
     stats: dict,
     episode_time: float,
+    rot_entropy: torch.Tensor | None = None,
 ) -> None:
     n_placed  = env.n_placed()
     n_rollout = stats["n_rollout_placed_init"]
@@ -405,7 +479,7 @@ def _log_training_step(
     _log_training_step._prev_misses = misses
     _log_training_step._prev_hits   = hits
 
-    wandb.log({
+    log_dict = {
         "agent/density":            reward,
         "agent/parts_placed":       n_placed / n_parts_ep,
         "agent/vs_greedy":          vs_greedy,
@@ -419,7 +493,10 @@ def _log_training_step(
         "cache/hit_rate":           ep_hit_rate,
         "cache/misses_per_episode": ep_misses,
         "cache/size":               cache_size,
-    }, step=episode + 1)
+    }
+    if rot_entropy is not None:
+        log_dict["loss/rot_entropy"] = rot_entropy.item()
+    wandb.log(log_dict, step=episode + 1)
 
 _log_training_step._prev_misses = 0
 _log_training_step._prev_hits   = 0
@@ -432,6 +509,7 @@ def _log_eval_set(
     device: torch.device,
     args: argparse.Namespace,
     episode: int,
+    rotations_rad: list[float] | None = None,
 ) -> float:
     n = len(eval_configs)
     print(f"[eval]  ep={episode+1:>5}/{args.episodes}  {n} configs …", end="", flush=True)
@@ -448,7 +526,7 @@ def _log_eval_set(
 
     for lib_ids in eval_configs:
         agent_density, snapshots, n_placed, unplaced_polys = _run_greedy_eval(
-            env, model, lib_ids, device, args
+            env, model, lib_ids, device, args, rotations_rad=rotations_rad,
         )
         env.reset(lib_ids)
         n_greedy       = env.place_remaining()
@@ -561,6 +639,13 @@ def train(args: argparse.Namespace) -> None:
     )
 
 
+    rotations_rad = (
+        env.get_rotation_angles(args.n_rotations)
+        if args.model == "split" and args.n_rotations > 0
+        else None
+    )
+    rot_entropy_coef = args.rot_entropy_coef if args.rot_entropy_coef is not None else args.entropy_coef
+
     best_density      = 0.0
     last_eval_density = 0.0
 
@@ -569,9 +654,9 @@ def train(args: argparse.Namespace) -> None:
         n_parts_ep = _curriculum_n_parts(episode, args)
         lib_ids    = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
         model.train()
-        log_probs, entropies, advantages, reward, _, stats, observations = _run_episode(
+        log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
             env, model, lib_ids, device, gamma=args.gamma,
-            value_interval=args.value_interval,
+            value_interval=args.value_interval, rotations_rad=rotations_rad,
         )
 
         entropy_coef   = _current_entropy_coef(episode, args)
@@ -580,11 +665,14 @@ def train(args: argparse.Namespace) -> None:
         if log_probs:
             old_log_probs = [lp.detach() for lp in log_probs]
             for _ in range(args.ppo_epochs):
-                new_log_probs, new_entropies, new_imitation = _evaluate_actions(
+                new_log_probs, new_entropies, new_rot_entropies, new_imitation = _evaluate_actions(
                     model, observations, device)
-                loss, entropy_bonus, imitation_loss = _ppo_loss(
+                loss, entropy_bonus, imitation_loss, rot_entropy = _ppo_loss(
                     old_log_probs, new_log_probs, new_entropies, new_imitation,
                     advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
+                    rot_entropies=new_rot_entropies,
+                    rot_entropy_coef=rot_entropy_coef,
+                    n_rotations=args.n_rotations,
                 )
                 if torch.isfinite(loss):
                     optimizer.zero_grad(set_to_none=True)
@@ -595,14 +683,18 @@ def train(args: argparse.Namespace) -> None:
                     loss = torch.tensor(0.0)
                     break
         else:
-            loss = entropy_bonus = imitation_loss = torch.tensor(0.0)
+            loss = entropy_bonus = imitation_loss = rot_entropy = torch.tensor(0.0)
 
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
-                           imitation_loss, imitation_coef, stats, episode_time)
+                           imitation_loss, imitation_coef, stats, episode_time,
+                           rot_entropy=rot_entropy)
 
         if (episode + 1) % args.eval_interval == 0:
-            last_eval_density = _log_eval_set(env, model, eval_configs, device, args, episode)
+            last_eval_density = _log_eval_set(
+                env, model, eval_configs, device, args, episode,
+                rotations_rad=rotations_rad,
+            )
 
         if last_eval_density > best_density:
             best_density = last_eval_density
@@ -655,6 +747,12 @@ def _parse() -> argparse.Namespace:
                    help="Allowed rotation angles in degrees for all parts "
                         "(e.g. --rotations 0 90 180 270). "
                         "If omitted, uses each part's own rotation list from the library.")
+    p.add_argument("--n-rotations",         type=int,   default=8,
+                   help="Number of evenly-spaced rotation angles the agent chooses from "
+                        "(SplitPointerNet only, default 8). Set 0 to disable rotation head.")
+    p.add_argument("--rot-entropy-coef",    type=float, default=None,
+                   help="Entropy bonus coefficient for the rotation head "
+                        "(default: same as --entropy-coef).")
     return p.parse_args()
 
 

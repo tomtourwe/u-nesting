@@ -483,6 +483,61 @@ impl Nester2D {
         Ok(None)
     }
 
+    /// Like `place_one_part` but uses a caller-supplied rotation instead of
+    /// searching over the geometry's allowed rotation list.
+    pub fn place_one_part_at_rotation(
+        &self,
+        geom: &Geometry2D,
+        placed: &[PlacedGeometry],
+        boundary: &Boundary2D,
+        sample_step: f64,
+        rotation: f64,
+    ) -> Result<Option<(f64, f64, f64)>> {
+        let margin = self.config.margin;
+        let spacing = self.config.spacing;
+        let boundary_polygon = self.get_boundary_polygon_with_margin(boundary, margin);
+
+        let ifp = match compute_ifp_with_margin(&boundary_polygon, geom, rotation, margin) {
+            Ok(ifp) => ifp,
+            Err(_) => return Ok(None),
+        };
+        if ifp.is_empty() {
+            return Ok(None);
+        }
+
+        let mut nfps: Vec<Nfp> = Vec::new();
+        for p in placed {
+            let cache_key = (
+                p.geometry.id().as_str(),
+                geom.id().as_str(),
+                rotation - p.rotation,
+            );
+            let nfp_at_origin = match self.nfp_cache.get_or_compute(cache_key, || {
+                compute_nfp(&p.geometry, geom, rotation - p.rotation)
+            }) {
+                Ok(nfp) => nfp,
+                Err(_) => continue,
+            };
+            let rotated = rotate_nfp(&nfp_at_origin, p.rotation);
+            let translated = translate_nfp(&rotated, p.position);
+            nfps.push(self.expand_nfp(&translated, spacing));
+        }
+
+        let ifp_shrunk = self.shrink_ifp(&ifp, spacing);
+        let nfp_refs: Vec<&Nfp> = nfps.iter().collect();
+        if let Some((x, y)) = find_bottom_left_placement(&ifp_shrunk, &nfp_refs, sample_step) {
+            let geom_aabb = geom.aabb_at_rotation(rotation);
+            let boundary_aabb = boundary.aabb();
+            if let Some((cx, cy)) =
+                clamp_placement_to_boundary_with_margin(x, y, geom_aabb, boundary_aabb, margin)
+            {
+                return Ok(Some((cx, cy, rotation)));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Gets the boundary polygon with margin applied.
     pub(crate) fn get_boundary_polygon_with_margin(
         &self,

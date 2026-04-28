@@ -1,12 +1,15 @@
 """
-Nest a random sample of parts from aligner_library.json into a 100x100 square.
+Nest a sample of parts from a shape-library JSON into a rectangular plate.
+
+Uses the Board2D incremental API (same as the training script / notebook):
+place parts one-by-one in the chosen order; the NFP engine finds the best
+position for each part.
 
 Usage:
-    python nest_aligner.py                   # uses NFP strategy, 25 random parts
-    python nest_aligner.py --n 30            # 30 random parts
-    python nest_aligner.py --strategy blf    # faster, lower quality
-    python nest_aligner.py --seed 42         # reproducible sample
-    python nest_aligner.py --no-plot         # skip the plot
+    python nest_aligner.py --json data/aligner_svgs.json --plate-width 400 --plate-height 250 --n all --sort --plot-out nest.png
+    python nest_aligner.py --strategy blf                     # faster, lower quality
+    python nest_aligner.py --seed 42                          # reproducible sample
+    python nest_aligner.py --no-plot                          # skip the plot
 """
 
 import argparse
@@ -16,165 +19,33 @@ import random
 import sys
 from pathlib import Path
 
-DATASET = Path(__file__).parent.parent / "repos/sparrow/data/input/aligner_library.json"
-BOUNDARY = {"width": 100.0, "height": 100.0}
+sys.path.insert(0, str(Path(__file__).parent.parent / "crates" / "python" / "python"))
+
+_DEFAULT_DATASET = Path(__file__).parent.parent / "repos/sparrow/data/input/aligner_library.json"
 
 
-def load_sample(n: int, seed: int | None, rotations_override: list[float] | None = None) -> list[dict]:
-    with open(DATASET) as f:
+def load_sample(n: int | str, seed: int | None, dataset: Path, rotations_override: list[float] | None = None) -> list[dict]:
+    with open(dataset) as f:
         data = json.load(f)
 
-    rng = random.Random(seed)
-    items = rng.sample(data["items"], n)
+    items = data["items"]
+    if n == "all":
+        sampled = items
+    else:
+        rng = random.Random(seed)
+        sampled = rng.sample(items, int(n))
 
-    geometries = []
-    for item in items:
-        geometries.append({
+    return [
+        {
             "id": item["label"],
             "polygon": item["shape"]["data"],
-            "quantity": 1,
             "rotations": rotations_override if rotations_override is not None else item["allowed_orientations"],
-        })
-    return geometries
-
-
-def run_via_json(geometries: list[dict], strategy: str, time_limit_ms: int) -> dict:
-    """
-    Invoke the nester via the JSON API (FFI / CLI path).
-    Falls back to printing the request JSON if the native module isn't built yet.
-    """
-    try:
-        import u_nesting  # built with maturin
-        result = u_nesting.solve_2d(
-            geometries=geometries,
-            boundary=BOUNDARY,
-            config={
-                "strategy": strategy,
-                "spacing": 0.0,
-                "time_limit_ms": time_limit_ms,
-            },
-        )
-        return result
-    except ModuleNotFoundError:
-        # Module not built yet — dump the request JSON so you can test another way
-        request = {
-            "geometries": geometries,
-            "boundary": BOUNDARY,
-            "config": {
-                "strategy": strategy,
-                "spacing": 0.0,
-                "time_limit_ms": time_limit_ms,
-            },
         }
-        out = Path("aligner_request.json")
-        out.write_text(json.dumps(request, indent=2))
-        print(f"[!] u_nesting module not found — request written to {out}")
-        print("    Build the Python bindings first (see instructions below).")
-        sys.exit(1)
-
-
-def print_result(result: dict, n_parts: int) -> None:
-    placed = len(result["placements"])
-    unplaced = len(result["unplaced"])
-    util = result["utilization"] * 100
-    ms = result["computation_time_ms"]
-
-    print(f"\nResult")
-    print(f"  Parts sampled : {n_parts}")
-    print(f"  Placed        : {placed}")
-    print(f"  Unplaced      : {unplaced}  {result['unplaced']}")
-    print(f"  Utilization   : {util:.1f}%")
-    print(f"  Time          : {ms / 1000:.2f}s")
-
-    if result.get("error"):
-        print(f"  Error         : {result['error']}")
-
-
-def rotate(polygon: list, angle_rad: float) -> list:
-    """Rotate polygon vertices around the origin by angle in radians."""
-    if angle_rad == 0.0:
-        return polygon
-    cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
-    return [
-        [x * cos_a - y * sin_a, x * sin_a + y * cos_a]
-        for x, y in polygon
+        for item in sampled
     ]
 
 
-def translate(polygon: list, tx: float, ty: float) -> list:
-    return [[x + tx, y + ty] for x, y in polygon]
-
-
-def plot_result(
-    result: dict,
-    geometries: list[dict],
-    boundary: dict,
-    save_path: Path | None = None,
-) -> None:
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.patches import Polygon as MplPolygon
-        from matplotlib.collections import PatchCollection
-    except ImportError:
-        print("[!] matplotlib not installed — run: pip install matplotlib")
-        return
-
-    # Build lookup: id -> polygon vertices
-    geom_map = {g["id"]: g["polygon"] for g in geometries}
-
-    w = boundary["width"]
-    h = boundary["height"]
-
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    # Draw boundary
-    ax.add_patch(plt.Rectangle((0, 0), w, h, linewidth=2, edgecolor="black", facecolor="#f5f5f5"))
-
-    # Color cycle
-    cmap = plt.get_cmap("tab20")
-    placed_ids = [p["geometry_id"] for p in result["placements"]]
-    color_map = {gid: cmap(i % 20) for i, gid in enumerate(sorted(set(placed_ids)))}
-
-    for placement in result["placements"]:
-        gid = placement["geometry_id"]
-        poly = geom_map.get(gid)
-        if poly is None:
-            continue
-
-        angle = placement["rotation"][0] if placement["rotation"] else 0.0
-        tx, ty = placement["position"][0], placement["position"][1]
-
-        transformed = translate(rotate(poly, angle), tx, ty)
-
-        color = color_map[gid]
-        patch = MplPolygon(transformed, closed=True, facecolor=(*color[:3], 0.6), edgecolor="black", linewidth=0.8)
-        ax.add_patch(patch)
-
-
-    # Mark unplaced
-    unplaced = result.get("unplaced", [])
-
-    util = result["utilization"] * 100
-    title = f"Nesting result — {len(result['placements'])} placed, {len(unplaced)} unplaced — {util:.1f}% utilization"
-    ax.set_title(title, fontsize=10)
-    ax.set_xlim(-2, w + 2)
-    ax.set_ylim(-2, h + 2)
-    ax.set_aspect("equal")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-        print(f"  Plot saved to {save_path}")
-    else:
-        plt.show()
-
-
 def polygon_area(vertices: list) -> float:
-    """Shoelace formula for polygon area."""
     n = len(vertices)
     area = 0.0
     for i in range(n):
@@ -184,35 +55,141 @@ def polygon_area(vertices: list) -> float:
     return abs(area) / 2.0
 
 
+def run_board2d(geometries: list[dict], strategy: str, boundary: dict) -> tuple:
+    """
+    Incremental greedy placement via Board2D (same API as the RL training loop).
+    Returns (placed_polygons, placements, utilization).
+    """
+    from u_nesting import Board2D
+
+    board = Board2D(
+        boundary=boundary,
+        geometries=geometries,
+        config={"strategy": strategy, "spacing": 0.0},
+    )
+
+    placed = 0
+    failed = []
+    snapshots = []  # list of (placed_polygons, placements, util, label) after each step
+
+    for i, g in enumerate(geometries):
+        result = board.place(g["id"])
+        if result is not None:
+            placed += 1
+            util_now = board.utilization()
+            pos = result["position"]
+            rot = math.degrees(result["rotation"])
+            print(f"  [{i+1:3d}/{len(geometries)}] placed {g['id']:8s}  pos=({pos[0]:7.1f}, {pos[1]:7.1f})  rot={rot:5.1f}°  util={util_now:.1%}")
+            snapshots.append((
+                list(board.placed_polygons()),
+                list(board.placements()),
+                util_now,
+                f"step {placed}\n{g['id']}  {util_now:.0%}",
+            ))
+        else:
+            failed.append(g["id"])
+            print(f"  [{i+1:3d}/{len(geometries)}] FAILED {g['id']}")
+
+    util = board.utilization()
+    print(f"\nResult")
+    print(f"  Parts submitted : {len(geometries)}")
+    print(f"  Placed          : {placed}")
+    print(f"  Failed to place : {len(failed)}  {failed}")
+    print(f"  Utilization     : {util:.1%}")
+
+    return snapshots, board.placed_polygons(), board.placements(), util
+
+
+def _draw_board_state(ax, placed_polygons, placements, boundary, title, cmap):
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Polygon as MplPolygon
+    w, h = boundary["width"], boundary["height"]
+    ax.add_patch(plt.Rectangle((0, 0), w, h, linewidth=1, edgecolor="black", facecolor="#f5f5f5"))
+    color_map = {p["geometry_id"]: cmap(i % 20) for i, p in enumerate(placements)}
+    for verts, placement in zip(placed_polygons, placements):
+        color = color_map[placement["geometry_id"]]
+        ax.add_patch(MplPolygon(verts, closed=True, facecolor=(*color[:3], 0.6),
+                                edgecolor="black", linewidth=0.3))
+    ax.set_xlim(0, w); ax.set_ylim(0, h)
+    ax.set_aspect("equal"); ax.axis("off")
+    ax.set_title(title, fontsize=6)
+
+
+def plot_steps(
+    snapshots: list,
+    final_polygons: list,
+    final_placements: list,
+    boundary: dict,
+    save_path: Path | None = None,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[!] matplotlib not installed")
+        return
+
+    cmap = plt.get_cmap("tab20")
+    w, h = boundary["width"], boundary["height"]
+
+    # Include final state as last panel
+    all_frames = snapshots + [(final_polygons, final_placements, snapshots[-1][2] if snapshots else 0,
+                               f"final\n{len(final_placements)} placed")]
+
+    n = len(all_frames)
+    ncols = math.ceil(math.sqrt(n * w / h))
+    nrows = math.ceil(n / ncols)
+
+    import numpy as np
+    cell_w = 3 * w / max(w, h)
+    cell_h = 3 * h / max(w, h)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * cell_w, nrows * cell_h))
+    axes = np.array(axes).flatten()
+
+    for i, (polys, pls, _, label) in enumerate(all_frames):
+        _draw_board_state(axes[i], polys, pls, boundary, label, cmap)
+
+    for ax in axes[n:]:
+        ax.axis("off")
+
+    plt.suptitle(f"Nesting steps — {len(final_placements)} placed, {boundary['width']:.0f}×{boundary['height']:.0f} mm", fontsize=10)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"  Plot saved to {save_path}")
+    else:
+        plt.show()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n", type=int, default=25, help="Number of parts to sample")
+    parser.add_argument("--json", type=Path, default=_DEFAULT_DATASET, help="Shape library JSON")
+    parser.add_argument("--plate-width",  type=float, default=100.0)
+    parser.add_argument("--plate-height", type=float, default=100.0)
+    parser.add_argument("--n", default="25", help="Number of parts to sample, or 'all'")
     parser.add_argument("--strategy", default="nfp", choices=["nfp", "blf", "ga", "brkga", "sa"])
-    parser.add_argument("--time-limit", type=int, default=30000, help="Time limit in ms")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    parser.add_argument("--save", action="store_true", help="Save result to result.json")
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--rotations", type=float, nargs="+", default=None,
-                        help="Override allowed rotations in degrees, e.g. --rotations 0 90 180 270")
-    parser.add_argument("--sort", action="store_true", help="Sort parts largest area first before nesting")
-    parser.add_argument("--no-plot", action="store_true", help="Skip the plot")
-    parser.add_argument("--plot-out", type=Path, default=None, help="Save plot to file instead of showing it (e.g. nest.png)")
+                        help="Override rotations in degrees, e.g. --rotations 0 90 180 270")
+    parser.add_argument("--sort", action="store_true", help="Largest-area-first ordering")
+    parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--plot-out", type=Path, default=None, help="Save PNG instead of showing")
     args = parser.parse_args()
 
-    print(f"Sampling {args.n} parts (seed={args.seed}), strategy={args.strategy} ...")
-    geometries = load_sample(args.n, args.seed, rotations_override=args.rotations)
+    boundary = {"width": args.plate_width, "height": args.plate_height}
+    n_label = args.n if args.n == "all" else int(args.n)
+
+    print(f"Loading {n_label} parts from {args.json}, strategy={args.strategy} ...")
+    geometries = load_sample(n_label, args.seed, dataset=args.json, rotations_override=args.rotations)
 
     if args.sort:
         geometries.sort(key=lambda g: polygon_area(g["polygon"]), reverse=True)
+        print(f"  Sorted largest-first (areas {polygon_area(geometries[0]['polygon']):.0f} → {polygon_area(geometries[-1]['polygon']):.0f} mm²)")
 
-    result = run_via_json(geometries, args.strategy, args.time_limit)
-    print_result(result, args.n)
-
-    if args.save:
-        Path("result.json").write_text(json.dumps(result, indent=2))
-        print("\n  Result saved to result.json")
+    snapshots, placed_polys, placements, _ = run_board2d(geometries, args.strategy, boundary)
 
     if not args.no_plot:
-        plot_result(result, geometries, BOUNDARY, save_path=args.plot_out)
+        plot_steps(snapshots, placed_polys, placements, boundary, save_path=args.plot_out)
 
 
 if __name__ == "__main__":

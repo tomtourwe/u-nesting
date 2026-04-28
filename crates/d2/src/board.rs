@@ -236,6 +236,93 @@ impl Board2D {
             .collect()
     }
 
+    /// Place part `id` at a fixed `rotation` (radians) using the fine grid.
+    ///
+    /// The NFP engine finds the best (x, y) for that rotation only.
+    /// Returns `Some(PlacementInfo)` on success, `None` if the part doesn't fit.
+    pub fn place_with_rotation(
+        &mut self,
+        id: &str,
+        rotation: f64,
+    ) -> Result<Option<PlacementInfo>> {
+        let geom = match self.geom_map.get(id) {
+            Some(g) => g.clone(),
+            None => return Ok(None),
+        };
+        match self.nester.place_one_part_at_rotation(
+            &geom,
+            &self.placed,
+            &self.boundary,
+            self.sample_step,
+            rotation,
+        )? {
+            Some((x, y, r)) => {
+                self.placed.push(PlacedGeometry::new(geom.clone(), (x, y), r));
+                Ok(Some(PlacementInfo { geometry_id: id.to_string(), x, y, rotation: r }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Speculatively place each `(id, rotation)` pair (without committing) and
+    /// return board-space polygon vertices, or `None` if the part doesn't fit
+    /// at that rotation.
+    ///
+    /// `ids` and `rotations` are parallel slices of the same length (N×R).
+    /// Uses the coarse rollout grid. Evaluated in parallel when `parallel` is enabled.
+    pub fn preview_all_per_rotation(
+        &self,
+        ids: &[String],
+        rotations: &[f64],
+    ) -> Vec<Option<Vec<(f64, f64)>>> {
+        let step = self.rollout_sample_step;
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            ids.par_iter()
+                .zip(rotations.par_iter())
+                .map(|(id, &rotation)| {
+                    let geom = self.geom_map.get(id)?;
+                    match self.nester.place_one_part_at_rotation(
+                        geom,
+                        &self.placed,
+                        &self.boundary,
+                        step,
+                        rotation,
+                    ) {
+                        Ok(Some((x, y, r))) => {
+                            let pg = PlacedGeometry::new(geom.clone(), (x, y), r);
+                            Some(pg.translated_exterior())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            ids.iter()
+                .zip(rotations.iter())
+                .map(|(id, &rotation)| {
+                    let geom = self.geom_map.get(id)?;
+                    match self.nester.place_one_part_at_rotation(
+                        geom,
+                        &self.placed,
+                        &self.boundary,
+                        step,
+                        rotation,
+                    ) {
+                        Ok(Some((x, y, r))) => {
+                            let pg = PlacedGeometry::new(geom.clone(), (x, y), r);
+                            Some(pg.translated_exterior())
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        }
+    }
+
     /// For each geometry id in `ids`, speculatively place it (no commit) and
     /// return the board-space polygon vertices, or `None` if it doesn't fit.
     ///

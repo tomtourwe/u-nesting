@@ -5,7 +5,8 @@ Two variants are provided:
 
 SplitPointerNet (default)
     Separate board CNN and 2-channel part CNN. Board encoded once per step.
-    Each candidate part is encoded from (delta, resulting-board) pair images.
+    Each candidate part × rotation is encoded from (delta, result) pair images.
+    Returns (part_logits, rot_feats, ctx) for hierarchical (part, rotation) sampling.
     Trains end-to-end from random init — no pretrained backbone required.
 
 SpatialPointerNet
@@ -13,15 +14,18 @@ SpatialPointerNet
     (8×8 feature map). All N×64 tokens pass through a shared Transformer that
     attends across both spatial positions and candidates simultaneously.
 
-Episode loop (both models)
+Episode loop (SplitPointerNet with rotation)
 ---------------
     env.reset(lib_ids)
+    rotations_rad = env.get_rotation_angles(n_rotations=8)
     for step in range(n_parts):
-        pair_images_t = torch.from_numpy(env.preview_pair_images())  # (N, 2, 128, 128)
-        mask          = build_remaining_mask(env.remaining_item_ids(), N)
-        logits        = model(pair_images_t, mask)                   # (N,)
-        part_id       = Categorical(logits=logits).sample()
-        env.place_anywhere(part_id.item())
+        obs    = torch.from_numpy(env.preview_images_per_rotation(rotations_rad))
+        mask   = build_remaining_mask(env.remaining_item_ids(), N)
+        part_logits, rot_feats, ctx = model(obs, mask)        # (N,), (N,R,128), (N,128)
+        part_id  = Categorical(logits=part_logits).sample()
+        rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])  # (R,)
+        rot_id   = Categorical(logits=rot_logits).sample()
+        env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
 """
 
 import torch
@@ -67,6 +71,38 @@ class PartTransformer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# RotationHead
+# ---------------------------------------------------------------------------
+
+class RotationHead(nn.Module):
+    """
+    Scores R rotation candidates for a selected part.
+
+    Input:  ctx       (dim,)    context vector for the selected part
+            rot_feats (R, dim)  per-rotation CNN embeddings
+    Output: rot_logits (R,)
+    """
+
+    def __init__(self, dim: int = 128):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.ReLU(True),
+            nn.Linear(dim, 1),
+        )
+
+    def forward(self, ctx: torch.Tensor, rot_feats: torch.Tensor) -> torch.Tensor:
+        """
+        ctx      : (dim,)
+        rot_feats: (R, dim)
+        Returns  : (R,) logits
+        """
+        R       = rot_feats.shape[0]
+        ctx_exp = ctx.unsqueeze(0).expand(R, -1)                      # (R, dim)
+        return self.mlp(torch.cat([ctx_exp, rot_feats], dim=-1)).squeeze(-1)  # (R,)
+
+
+# ---------------------------------------------------------------------------
 # SplitPointerNet
 # ---------------------------------------------------------------------------
 
@@ -103,56 +139,67 @@ class SplitPointerNet(nn.Module):
     """
     Pointer Network with separate board and part encoders. Trains from scratch.
 
-    Per-step forward:
-        env.preview_pair_images()  →  pair_images  (N, 2, 128, 128)
-        board    = pair_images[0, 0]                          →  (1, 1, 128, 128)
-        deltas   = pair_images[:, 1] − pair_images[:, 0]     →  (N, 1, 128, 128)
-        result   = pair_images[:, 1]                         →  (N, 1, 128, 128)
-        part_in  = cat([deltas, result], dim=1)              →  (N, 2, 128, 128)
-        board_feat = board_cnn(board)                        →  (1, 128)   once per step
-        part_feats = part_cnn(part_in)                       →  (N, 128)   one per candidate
-        fused      = fusion(cat[board_feat, part_feats])     →  (N, 128)
-        ctx        = PartTransformer(fused, mask)            →  (N, 128)
-        logits     = part_head(ctx)                          →  (N,)
+    Per-step forward (R rotations, N parts):
+        obs = env.preview_images_per_rotation(rotations_rad)  # (N, R+1, 128, 128)
+        board      = obs[0, 0]                                 →  (1, 1, 128, 128)
+        For each (part i, rotation r):
+          delta[i,r]  = obs[i, r+1] − obs[i, 0]              →  (1, 128, 128)
+          result[i,r] = obs[i, r+1]                           →  (1, 128, 128)
+        part_in    = stack all (delta, result) pairs           →  (N*R, 2, 128, 128)
+        board_feat = board_cnn(board)                          →  (1, 128)
+        rot_feats  = part_cnn(part_in).reshape(N, R, 128)     →  (N, R, 128)
+        part_feats = rot_feats.mean(dim=1)                     →  (N, 128)
+        fused      = fusion(cat[board_feat, part_feats])       →  (N, 128)
+        ctx        = PartTransformer(fused, mask)              →  (N, 128)
+        part_logits = part_head(ctx)                           →  (N,)
+        # After sampling part_id:
+        rot_logits = rotation_head(ctx[part_id], rot_feats[part_id])  →  (R,)
     """
 
     def __init__(self):
         super().__init__()
-        self.board_cnn = _SpatialCNN(in_channels=1)
-        self.part_cnn  = _SpatialCNN(in_channels=2)
-        self.fusion    = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.ReLU(True),
-        )
-        self.part_ctx  = PartTransformer()
-        self.part_head = nn.Linear(128, 1)
+        self.board_cnn     = _SpatialCNN(in_channels=1)
+        self.part_cnn      = _SpatialCNN(in_channels=2)
+        self.fusion        = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
+        self.part_ctx      = PartTransformer()
+        self.part_head     = nn.Linear(128, 1)
+        self.rotation_head = RotationHead()
 
     def forward(
         self,
-        pair_images: torch.Tensor,  # (N, 2, 128, 128)
-        mask:        torch.Tensor,  # (N,) 1=available, 0=placed
-    ) -> torch.Tensor:
+        obs:  torch.Tensor,  # (N, R+1, 128, 128)
+        mask: torch.Tensor,  # (N,) 1=available, 0=placed
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Score all candidate parts jointly.
+        Score all candidate parts jointly and return per-rotation embeddings.
 
-        Returns part_logits (N,) — placed parts are set to −1e9.
+        Returns:
+            part_logits : (N,)        placed parts set to −1e9
+            rot_feats   : (N, R, 128) per-(part, rotation) CNN embeddings
+            ctx         : (N, 128)    context-enriched part embeddings
         """
-        board   = pair_images[0, 0].unsqueeze(0).unsqueeze(0)           # (1, 1, 128, 128)
-        deltas  = (pair_images[:, 1] - pair_images[:, 0]).unsqueeze(1)  # (N, 1, 128, 128)
-        result  = pair_images[:, 1].unsqueeze(1)                        # (N, 1, 128, 128)
-        part_in = torch.cat([deltas, result], dim=1)                    # (N, 2, 128, 128)
+        N, Rp1, H, W = obs.shape
+        R = Rp1 - 1
 
-        board_feat = self.board_cnn(board)                              # (1, 128)
-        part_feats = self.part_cnn(part_in)                             # (N, 128)
+        board        = obs[0, 0].unsqueeze(0).unsqueeze(0)             # (1, 1, H, W)
+        current_flat = obs[:, 0].unsqueeze(1).expand(N, R, H, W)\
+                           .reshape(N * R, 1, H, W)                    # (N*R, 1, H, W)
+        after_flat   = obs[:, 1:].reshape(N * R, 1, H, W)             # (N*R, 1, H, W)
+        part_in      = torch.cat([after_flat - current_flat,
+                                  after_flat], dim=1)                  # (N*R, 2, H, W)
+
+        board_feat = self.board_cnn(board)                             # (1, 128)
+        rot_feats  = self.part_cnn(part_in).reshape(N, R, 128)        # (N, R, 128)
+        part_feats = rot_feats.mean(dim=1)                             # (N, 128)
 
         fused = self.fusion(torch.cat([
-            board_feat.expand(part_feats.shape[0], -1),
+            board_feat.expand(N, -1),
             part_feats,
-        ], dim=-1))                                                      # (N, 128)
+        ], dim=-1))                                                     # (N, 128)
 
-        ctx    = self.part_ctx(fused, mask)                             # (N, 128)
-        logits = self.part_head(ctx).squeeze(-1)                        # (N,)
-        return logits.masked_fill(mask == 0, -1e9)
+        ctx    = self.part_ctx(fused, mask)                            # (N, 128)
+        logits = self.part_head(ctx).squeeze(-1)                       # (N,)
+        return logits.masked_fill(mask == 0, -1e9), rot_feats, ctx
 
 
 # ---------------------------------------------------------------------------
@@ -250,17 +297,31 @@ class SpatialPointerNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    N_PARTS = 6
-    device  = torch.device("cpu")
+    N_PARTS     = 6
+    N_ROTATIONS = 8
+    device      = torch.device("cpu")
 
-    for name, model in [("SplitPointerNet", SplitPointerNet()),
-                         ("SpatialPointerNet", SpatialPointerNet())]:
-        model.eval()
-        pair_images = torch.rand(N_PARTS, 2, 128, 128)
-        mask        = torch.ones(N_PARTS)
-        mask[2]     = 0.0  # mark part 2 as placed
+    # SplitPointerNet — hierarchical (part, rotation) interface
+    model = SplitPointerNet().eval()
+    obs   = torch.rand(N_PARTS, N_ROTATIONS + 1, 128, 128)
+    mask  = torch.ones(N_PARTS)
+    mask[2] = 0.0
 
-        logits = model(pair_images, mask)
-        assert logits.shape == (N_PARTS,), f"expected ({N_PARTS},), got {tuple(logits.shape)}"
-        assert logits[2].item() == -1e9, "masked part should be -1e9"
-        print(f"{name} shape check OK — logits: {tuple(logits.shape)}")
+    part_logits, rot_feats, ctx = model(obs, mask)
+    assert part_logits.shape == (N_PARTS,),              f"part_logits: {tuple(part_logits.shape)}"
+    assert rot_feats.shape   == (N_PARTS, N_ROTATIONS, 128), f"rot_feats: {tuple(rot_feats.shape)}"
+    assert ctx.shape         == (N_PARTS, 128),          f"ctx: {tuple(ctx.shape)}"
+    assert part_logits[2].item() == -1e9,                "masked part should be -1e9"
+
+    rot_logits = model.rotation_head(ctx[0], rot_feats[0])
+    assert rot_logits.shape == (N_ROTATIONS,),           f"rot_logits: {tuple(rot_logits.shape)}"
+    print(f"SplitPointerNet shape check OK — part_logits: {tuple(part_logits.shape)}, "
+          f"rot_feats: {tuple(rot_feats.shape)}, rot_logits: {tuple(rot_logits.shape)}")
+
+    # SpatialPointerNet — unchanged interface (returns (N,) logits directly)
+    spatial = SpatialPointerNet().eval()
+    pair_images = torch.rand(N_PARTS, 2, 128, 128)
+    logits = spatial(pair_images, mask)
+    assert logits.shape == (N_PARTS,), f"expected ({N_PARTS},), got {tuple(logits.shape)}"
+    assert logits[2].item() == -1e9, "masked part should be -1e9"
+    print(f"SpatialPointerNet shape check OK — logits: {tuple(logits.shape)}")
