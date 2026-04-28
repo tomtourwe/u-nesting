@@ -237,8 +237,11 @@ class UNestingGymEnv:
                 else:
                     verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
                     part_canvas = _rasterize_polygon(verts_px, IMG)
-                    part_dist   = distance_transform_edt(~part_canvas).astype(np.float32)
-                    result_dist = np.minimum(base_dist, part_dist)
+                    # Use base_dist (board SDF) and zero-fill where the placed part
+                    # lands — avoids a per-(part,rotation) EDT call (was the bottleneck).
+                    # The board SDF halo around existing parts is preserved; the network
+                    # sees the placement footprint directly from the zero region.
+                    result_dist = base_dist.copy()
                     result_dist[base_canvas | part_canvas] = 0.0
                     result[ep, r_idx + 1] = (
                         np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
