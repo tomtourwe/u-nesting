@@ -460,6 +460,18 @@ def _log_training_step(
     greedy_d  = stats["rollout_density_init"]
     vs_greedy = reward / greedy_d if greedy_d > 0 else float("nan")
 
+    # Running mean of vs_greedy (EMA with α=0.05)
+    prev_mean = getattr(_log_training_step, "_vs_greedy_ema", vs_greedy)
+    ema = prev_mean + 0.05 * (vs_greedy - prev_mean) if not (vs_greedy != vs_greedy) else prev_mean
+    _log_training_step._vs_greedy_ema = ema
+
+    # Fraction of last 50 episodes that beat greedy
+    history = _log_training_step._vs_greedy_history
+    history.append(vs_greedy)
+    if len(history) > 50:
+        history.pop(0)
+    frac_above = sum(1 for v in history if v > 1.0) / len(history)
+
     end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
     print(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
@@ -483,6 +495,8 @@ def _log_training_step(
         "agent/density":            reward,
         "agent/parts_placed":       n_placed / n_parts_ep,
         "agent/vs_greedy":          vs_greedy,
+        "agent/vs_greedy_ema":      ema,
+        "agent/frac_above_greedy":  frac_above,
         "greedy/density":           greedy_d,
         "greedy/parts_placed":      n_rollout / n_parts_ep,
         "loss/total":               loss.item(),
@@ -498,8 +512,10 @@ def _log_training_step(
         log_dict["loss/rot_entropy"] = rot_entropy.item()
     wandb.log(log_dict, step=episode + 1)
 
-_log_training_step._prev_misses = 0
-_log_training_step._prev_hits   = 0
+_log_training_step._prev_misses    = 0
+_log_training_step._prev_hits      = 0
+_log_training_step._vs_greedy_ema  = 1.0
+_log_training_step._vs_greedy_history: list[float] = []
 
 
 def _log_eval_set(
