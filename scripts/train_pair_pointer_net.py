@@ -367,14 +367,19 @@ def _run_greedy_eval(
     device: torch.device,
     args: argparse.Namespace,
     rotations_rad: list[float] | None = None,
-) -> tuple[float, list, int, list]:
+) -> tuple[float, float, list, int, int, list]:
     """
-    Run the agent greedily (argmax) on eval_lib_ids and return results for logging.
+    Run the agent greedily (argmax) on eval_lib_ids.
 
     Uses a two-phase observation strategy when rotations are enabled:
-      Phase 1 — preview_pair_images()        (N Rust calls) → part head → argmax part
-      Phase 2 — preview_images_for_part()    (R Rust calls) → rotation head → argmax rot
+      Phase 1 — preview_pair_images()      (N Rust calls) → part head → argmax part
+      Phase 2 — preview_images_for_part()  (R Rust calls) → rotation head → argmax rot
     Total: N+R calls per step instead of N×R. No rollout_value() calls.
+
+    After the agent episode ends, place_remaining() fills whatever is left
+    (engine picks rotation). This gives two metrics at no extra episode cost:
+      pure_density     — agent part+rotation selection only
+      fallback_density — agent selection + engine fills remaining gaps
     """
     model.eval()
     env.reset(eval_lib_ids)
@@ -420,6 +425,15 @@ def _run_greedy_eval(
 
     model.train()
 
+    # Pure: agent part+rotation only
+    pure_density  = env.packing_density()
+    n_placed_pure = env.n_placed()
+
+    # Fallback: engine fills whatever the agent couldn't place
+    n_fallback    = env.place_remaining()
+    fallback_density  = env.packing_density()
+    n_placed_fallback = n_placed_pure + n_fallback
+
     remaining      = env.remaining_item_ids()
     unplaced_polys = []
     for ep_id in remaining:
@@ -430,7 +444,7 @@ def _run_greedy_eval(
             if previews and previews[0] is not None:
                 unplaced_polys.append(previews[0])
 
-    return env.packing_density(), snapshots, env.n_placed(), unplaced_polys
+    return pure_density, fallback_density, snapshots, n_placed_pure, n_placed_fallback, unplaced_polys
 
 
 def _make_eval_figure(
@@ -575,7 +589,9 @@ def _log_eval_set(
     n = len(eval_configs)
     print(f"[eval]  ep={episode+1:>5}/{args.episodes}  {n} configs …", end="", flush=True)
 
-    ratios, agent_densities, greedy_densities, n_placed_list, n_greedy_list = [], [], [], [], []
+    ratios_pure, ratios_fb = [], []
+    agent_densities, fb_densities, greedy_densities = [], [], []
+    n_placed_list, n_placed_fb_list, n_greedy_list  = [], [], []
     plot_snapshots = plot_greedy_polys = plot_lib_ids = plot_unplaced_polys = None
     plot_n_placed = plot_n_greedy = 0
     plot_greedy_density = 0.0
@@ -586,19 +602,24 @@ def _log_eval_set(
     worst_ratio = float("inf")
 
     for lib_ids in eval_configs:
-        agent_density, snapshots, n_placed, unplaced_polys = _run_greedy_eval(
+        pure_density, fb_density, snapshots, n_placed, n_placed_fb, unplaced_polys = _run_greedy_eval(
             env, model, lib_ids, device, args, rotations_rad=rotations_rad,
         )
         env.reset(lib_ids)
         n_greedy       = env.place_remaining()
         greedy_polys   = env.placed_polygons()
         greedy_density = env.packing_density()
-        ratio          = agent_density / greedy_density if greedy_density > 0 else float("nan")
 
-        ratios.append(ratio)
-        agent_densities.append(agent_density)
+        ratio_pure = pure_density / greedy_density if greedy_density > 0 else float("nan")
+        ratio_fb   = fb_density   / greedy_density if greedy_density > 0 else float("nan")
+
+        ratios_pure.append(ratio_pure)
+        ratios_fb.append(ratio_fb)
+        agent_densities.append(pure_density)
+        fb_densities.append(fb_density)
         greedy_densities.append(greedy_density)
         n_placed_list.append(n_placed)
+        n_placed_fb_list.append(n_placed_fb)
         n_greedy_list.append(n_greedy)
 
         if n_greedy > best_n_greedy:
@@ -611,8 +632,8 @@ def _log_eval_set(
             plot_greedy_density  = greedy_density
             plot_unplaced_polys  = unplaced_polys
 
-        if not np.isnan(ratio) and ratio < worst_ratio:
-            worst_ratio           = ratio
+        if not np.isnan(ratio_pure) and ratio_pure < worst_ratio:
+            worst_ratio           = ratio_pure
             worst_snapshots       = snapshots
             worst_greedy_polys    = greedy_polys
             worst_lib_ids         = lib_ids
@@ -621,18 +642,21 @@ def _log_eval_set(
             worst_greedy_density  = greedy_density
             worst_unplaced_polys  = unplaced_polys
 
-    mean_ratio         = float(np.mean(ratios))
-    std_ratio          = float(np.std(ratios))
-    max_ratio          = float(np.max(ratios))
-    pct_above          = int(round(100 * np.mean([r > 1.0 for r in ratios])))
+    mean_ratio_pure    = float(np.mean(ratios_pure))
+    mean_ratio_fb      = float(np.mean(ratios_fb))
+    pct_above_pure     = int(round(100 * np.mean([r > 1.0 for r in ratios_pure])))
+    pct_above_fb       = int(round(100 * np.mean([r > 1.0 for r in ratios_fb])))
     mean_placed        = float(np.mean(n_placed_list))
+    mean_placed_fb     = float(np.mean(n_placed_fb_list))
     mean_greedy_placed = float(np.mean(n_greedy_list))
     mean_agent         = float(np.mean(agent_densities))
+    mean_fb            = float(np.mean(fb_densities))
     mean_greedy        = float(np.mean(greedy_densities))
 
-    print(f"  agent={mean_agent:.4f}  greedy={mean_greedy:.4f}  vs_greedy={mean_ratio:.3f}"
-          f"  beat_greedy={pct_above}%"
-          f"  placed={mean_placed:.1f} vs greedy={mean_greedy_placed:.1f}/{len(plot_lib_ids)}")
+    print(f"  pure={mean_agent:.4f}({mean_ratio_pure:.3f})  "
+          f"fallback={mean_fb:.4f}({mean_ratio_fb:.3f})  "
+          f"greedy={mean_greedy:.4f}  "
+          f"placed={mean_placed:.1f}/{mean_placed_fb:.1f} vs {mean_greedy_placed:.1f}")
 
     fig_best = _make_eval_figure(
         plot_snapshots, plot_n_placed, plot_lib_ids, episode, args,
@@ -643,17 +667,20 @@ def _log_eval_set(
         worst_greedy_polys, worst_n_greedy, worst_greedy_density, worst_unplaced_polys,
     )
     wandb.log({
-        "eval/board_best":       wandb.Image(fig_best),
-        "eval/board_worst":      wandb.Image(fig_worst),
-        "eval/agent_density":    mean_agent,
-        "eval/greedy_density":   mean_greedy,
-        "eval/vs_greedy":        mean_ratio,
-        "eval/beat_greedy_pct":  pct_above,
+        "eval/board_best":            wandb.Image(fig_best),
+        "eval/board_worst":           wandb.Image(fig_worst),
+        "eval/agent_density":         mean_agent,
+        "eval/agent_density_fallback": mean_fb,
+        "eval/greedy_density":        mean_greedy,
+        "eval/vs_greedy":             mean_ratio_pure,
+        "eval/vs_greedy_fallback":    mean_ratio_fb,
+        "eval/beat_greedy_pct":       pct_above_pure,
+        "eval/beat_greedy_pct_fallback": pct_above_fb,
     }, step=episode + 1)
     plt.close(fig_best)
     plt.close(fig_worst)
 
-    return mean_ratio
+    return mean_ratio_pure
 
 
 def train(args: argparse.Namespace) -> None:
