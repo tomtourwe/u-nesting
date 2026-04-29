@@ -165,6 +165,23 @@ class SplitPointerNet(nn.Module):
         self.part_head     = nn.Linear(128, 1)
         self.rotation_head = RotationHead()
 
+    def rotation_feats_for_part(self, obs_part: torch.Tensor) -> torch.Tensor:
+        """
+        Compute rotation features for a single part without a full forward pass.
+
+        Used in two-phase eval: after the part head selects a part using cheap
+        pair-image observations, this encodes the R rotation candidates for the
+        chosen part only.
+
+        obs_part : (R+1, H, W) — channel 0 = board SDF, channels 1..R = after-SDFs
+        Returns  : (R, 128)
+        """
+        R, H, W  = obs_part.shape[0] - 1, obs_part.shape[1], obs_part.shape[2]
+        current  = obs_part[0].unsqueeze(0).expand(R, H, W).unsqueeze(1)   # (R, 1, H, W)
+        after    = obs_part[1:].unsqueeze(1)                                 # (R, 1, H, W)
+        part_in  = torch.cat([after - current, after], dim=1)               # (R, 2, H, W)
+        return self.part_cnn(part_in)                                        # (R, 128)
+
     def forward(
         self,
         obs:  torch.Tensor,  # (N, R+1, 128, 128)

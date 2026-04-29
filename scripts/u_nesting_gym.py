@@ -300,6 +300,53 @@ class UNestingGymEnv:
 
         return result
 
+    def preview_images_for_part(self, episode_id: int, rotations_rad: list[float]) -> np.ndarray:
+        """
+        Build (R+1, IMG_SIZE, IMG_SIZE) observation for a single part.
+
+        Channel 0      : current board SDF.
+        Channels 1..R+1: board SDF after placing part `episode_id` at each rotation.
+        Falls back to current SDF if the part is already placed or doesn't fit.
+
+        Used in two-phase eval: cheap N-call part selection followed by R-call
+        rotation selection for the chosen part only (N+R instead of N×R).
+        """
+        from scipy.ndimage import distance_transform_edt
+
+        R             = len(rotations_rad)
+        IMG           = self.IMG_SIZE
+        episode_geoms = self._episode_geoms()
+        geom_id       = episode_geoms[episode_id]["id"]
+
+        # Base board SDF
+        base_canvas = np.zeros((IMG, IMG), dtype=bool)
+        for verts_board in self._board.placed_polygons():
+            verts_px = [(x * self._sx, y * self._sy) for x, y in verts_board]
+            base_canvas |= _rasterize_polygon(verts_px, IMG)
+
+        if base_canvas.any():
+            base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
+            current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+        else:
+            base_dist   = np.full((IMG, IMG), np.inf, dtype=np.float32)
+            current_sdf = np.ones((IMG, IMG), dtype=np.float32)
+
+        raw = self._board.preview_all_per_rotation([geom_id] * R, rotations_rad)
+
+        result    = np.empty((R + 1, IMG, IMG), dtype=np.float32)
+        result[0] = current_sdf
+        for r_idx, verts_board in enumerate(raw):
+            if verts_board is None:
+                result[r_idx + 1] = current_sdf
+            else:
+                verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
+                part_canvas = _rasterize_polygon(verts_px, IMG)
+                result_dist = base_dist.copy()
+                result_dist[base_canvas | part_canvas] = 0.0
+                result[r_idx + 1] = np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+
+        return result
+
     def rollout_value(self) -> tuple[float, int]:
         """
         Run a greedy rollout on remaining parts, then restore the board.

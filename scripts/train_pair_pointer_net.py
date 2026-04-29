@@ -368,24 +368,69 @@ def _run_greedy_eval(
     args: argparse.Namespace,
     rotations_rad: list[float] | None = None,
 ) -> tuple[float, list, int, list]:
+    """
+    Run the agent greedily (argmax) on eval_lib_ids and return results for logging.
+
+    Uses a two-phase observation strategy when rotations are enabled:
+      Phase 1 — preview_pair_images()        (N Rust calls) → part head → argmax part
+      Phase 2 — preview_images_for_part()    (R Rust calls) → rotation head → argmax rot
+    Total: N+R calls per step instead of N×R. No rollout_value() calls.
+    """
     model.eval()
+    env.reset(eval_lib_ids)
+    n_parts    = len(eval_lib_ids)
+    snapshots: list = []
+    skip_ids:  set[int] = set()
+
     with torch.no_grad():
-        _, _, _, _, eval_density, eval_snapshots, _, _ = _run_episode(
-            env, model, eval_lib_ids, device,
-            greedy=True, gamma=args.gamma, capture_snapshots=True,
-            rotations_rad=rotations_rad,
-        )
+        for _ in range(n_parts):
+            remaining = [r for r in env.remaining_item_ids() if r not in skip_ids]
+            if not remaining:
+                break
+
+            mask = _build_remaining_mask(remaining, n_parts, device)
+
+            # Phase 1: part selection via cheap pair images (N Rust calls)
+            obs_pair = torch.from_numpy(env.preview_pair_images()).to(device)
+            output   = model(obs_pair, mask)
+            if isinstance(output, tuple):
+                part_logits, _, ctx = output
+            else:
+                part_logits, ctx = output, None
+
+            part_id = int(part_logits.argmax().item())
+
+            # Phase 2: rotation selection for chosen part only (R Rust calls)
+            if rotations_rad is not None and ctx is not None and hasattr(model, "rotation_head"):
+                obs_part   = torch.from_numpy(
+                    env.preview_images_for_part(part_id, rotations_rad)
+                ).to(device)
+                rot_feats  = model.rotation_feats_for_part(obs_part)   # (R, 128)
+                rot_logits = model.rotation_head(ctx[part_id], rot_feats)
+                rot_id     = int(rot_logits.argmax().item())
+                success    = env.place_with_rotation(part_id, rotations_rad[rot_id])
+            else:
+                success = env.place_anywhere(part_id)
+
+            if not success:
+                skip_ids.add(part_id)
+                continue
+
+            snapshots.append((env.placed_polygons(), env.packing_density()))
+
     model.train()
+
     remaining      = env.remaining_item_ids()
     unplaced_polys = []
     for ep_id in remaining:
         ep_geoms = env._episode_geoms()
         if ep_id < len(ep_geoms):
-            geom_id = ep_geoms[ep_id]["id"]
+            geom_id  = ep_geoms[ep_id]["id"]
             previews = env._board.preview_all([geom_id])
             if previews and previews[0] is not None:
                 unplaced_polys.append(previews[0])
-    return eval_density, eval_snapshots, env.n_placed(), unplaced_polys
+
+    return env.packing_density(), snapshots, env.n_placed(), unplaced_polys
 
 
 def _make_eval_figure(
