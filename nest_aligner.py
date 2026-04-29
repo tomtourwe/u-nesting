@@ -19,7 +19,32 @@ import random
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "crates" / "python" / "python"))
+
+
+def _normalize_polygon(vertices: list) -> list:
+    """Center and rotationally normalise so rotation=0° means the same
+    visual orientation for every part: tall, concavity facing up."""
+    pts = np.array(vertices, dtype=np.float64)
+    pts -= pts.mean(axis=0)
+    cov = np.cov(pts.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    major = eigvecs[:, np.argmax(eigvals)]
+    angle = np.arctan2(major[1], major[0])
+    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+    pts = (np.array([[cos_a, -sin_a], [sin_a, cos_a]]) @ pts.T).T
+    # Ensure tall orientation
+    w = pts[:, 0].max() - pts[:, 0].min()
+    h = pts[:, 1].max() - pts[:, 1].min()
+    if w > h:
+        pts = pts[:, ::-1].copy()
+    # Orient concavity upward: solid base pulls centroid below bbox mid
+    bbox_mid_y = (pts[:, 1].max() + pts[:, 1].min()) / 2.0
+    if pts[:, 1].mean() > bbox_mid_y:
+        pts[:, 1] = -pts[:, 1]
+    return pts.tolist()
 
 _DEFAULT_DATASET = Path(__file__).parent.parent / "repos/sparrow/data/input/aligner_library.json"
 
@@ -38,7 +63,7 @@ def load_sample(n: int | str, seed: int | None, dataset: Path, rotations_overrid
     return [
         {
             "id": item["label"],
-            "polygon": item["shape"]["data"],
+            "polygon": _normalize_polygon(item["shape"]["data"]),
             "rotations": rotations_override if rotations_override is not None else item["allowed_orientations"],
         }
         for item in sampled

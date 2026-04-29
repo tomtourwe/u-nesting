@@ -27,6 +27,55 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "crates" / "python" / "pyt
 from u_nesting import Board2D as _RustBoard2D
 
 
+def _normalize_polygon(vertices: list) -> list:
+    """
+    Center and rotationally normalise a polygon so rotation angles are
+    visually consistent across all parts.
+
+    Steps:
+      1. Translate centroid to origin.
+      2. PCA: rotate so the principal axis aligns with the x-axis.
+      3. Ensure tall orientation (height ≥ width) — if wider than tall,
+         rotate 90° so the long dimension runs vertically.
+      4. Resolve 180° flip: the concavity (open end of a U-shape) should
+         face upward. The centroid of a U sits toward the solid base, so
+         after centering it is displaced downward relative to the bounding
+         box mid-point. Flip vertically if the centroid is above the bbox
+         mid-point (meaning the solid part is on top, opening faces down).
+
+    Returns a new list of [x, y] pairs (floats).
+    """
+    pts = np.array(vertices, dtype=np.float64)
+
+    # 1. Centre
+    pts -= pts.mean(axis=0)
+
+    # 2. PCA — align principal axis with x-axis
+    cov = np.cov(pts.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    major = eigvecs[:, np.argmax(eigvals)]
+    angle = np.arctan2(major[1], major[0])
+    cos_a, sin_a = np.cos(-angle), np.sin(-angle)
+    pts = (np.array([[cos_a, -sin_a], [sin_a, cos_a]]) @ pts.T).T
+
+    # 3. Ensure tall (height ≥ width)
+    w = pts[:, 0].max() - pts[:, 0].min()
+    h = pts[:, 1].max() - pts[:, 1].min()
+    if w > h:
+        # swap x and y (rotate 90°)
+        pts = pts[:, ::-1].copy()
+
+    # 4. Orient concavity upward:
+    #    For a U-shape the solid base pulls the centroid down (y < bbox_mid).
+    #    If centroid_y > bbox_mid the solid is on top → flip vertically.
+    bbox_mid_y = (pts[:, 1].max() + pts[:, 1].min()) / 2.0
+    centroid_y = pts[:, 1].mean()
+    if centroid_y > bbox_mid_y:
+        pts[:, 1] = -pts[:, 1]
+
+    return pts.tolist()
+
+
 def _rasterize_polygon(vertices_px: list, size: int = 128) -> np.ndarray:
     """Fill a polygon (pixel coordinates) onto a boolean canvas."""
     img = Image.new("L", (size, size), 0)
@@ -69,7 +118,9 @@ class UNestingGymEnv:
 
         # Accept both a bare list and {"items": [...]} (sparrow-style)
         if isinstance(raw, list):
-            self._library: list[dict] = raw
+            self._library: list[dict] = [
+                {**g, "polygon": _normalize_polygon(g["polygon"])} for g in raw
+            ]
         elif isinstance(raw, dict) and "items" in raw:
             # Convert sparrow format.  Map allowed_orientations → rotations so the
             # Rust engine sees the library's orientation constraints even when no
@@ -77,7 +128,7 @@ class UNestingGymEnv:
             self._library = [
                 {
                     "id": item.get("label", str(i)),
-                    "polygon": item["shape"]["data"],
+                    "polygon": _normalize_polygon(item["shape"]["data"]),
                     "rotations": item.get("allowed_orientations", []),
                 }
                 for i, item in enumerate(raw["items"])

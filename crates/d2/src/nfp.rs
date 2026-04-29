@@ -1062,6 +1062,86 @@ pub fn find_bottom_left_placement(
     })
 }
 
+/// Like `find_bottom_left_placement` but scores candidates by the area of the
+/// bounding box that would enclose all already-placed parts plus the new part.
+/// This pulls parts together rather than packing them left-to-right.
+///
+/// * `existing_bbox` – current (min_x, min_y, max_x, max_y) of all placed
+///   parts, or `None` on an empty board (first placement falls back to
+///   bottom-left so the first part anchors near the origin).
+/// * `part_aabb` – `([min_dx, min_dy], [max_dx, max_dy])` of the new part at
+///   its rotation, relative to its reference point (from `aabb_at_rotation`).
+pub fn find_min_bbox_placement(
+    ifp: &Nfp,
+    nfps: &[&Nfp],
+    sample_step: f64,
+    existing_bbox: Option<(f64, f64, f64, f64)>,
+    part_aabb: ([f64; 2], [f64; 2]),
+) -> Option<(f64, f64)> {
+    if ifp.is_empty() {
+        return None;
+    }
+
+    // No placed parts yet — anchor with bottom-left so the board fills from a
+    // consistent corner rather than floating in the centre.
+    if existing_bbox.is_none() {
+        return find_bottom_left_placement(ifp, nfps, sample_step);
+    }
+    let (ex_min_x, ex_min_y, ex_max_x, ex_max_y) = existing_bbox.unwrap();
+
+    let ([pdx_min, pdy_min], [pdx_max, pdy_max]) = part_aabb;
+
+    // Collect candidates (IFP vertices + NFP vertices + grid)
+    let mut candidates: Vec<(f64, f64)> = Vec::new();
+    for polygon in &ifp.polygons {
+        candidates.extend(polygon.iter().copied());
+    }
+    for nfp in nfps {
+        for polygon in &nfp.polygons {
+            candidates.extend(polygon.iter().copied());
+        }
+    }
+    let (min_x, min_y, max_x, max_y) = ifp_bounding_box(ifp);
+    let mut y = min_y;
+    while y <= max_y {
+        let mut x = min_x;
+        while x <= max_x {
+            candidates.push((x, y));
+            x += sample_step;
+        }
+        y += sample_step;
+    }
+
+    // Filter to valid positions
+    let valid_candidates: Vec<(f64, f64)> = candidates
+        .into_iter()
+        .filter(|&point| {
+            let in_ifp = ifp
+                .polygons
+                .iter()
+                .any(|p| point_in_polygon(point, p) || point_on_polygon_boundary(point, p));
+            if !in_ifp {
+                return false;
+            }
+            point_outside_all_nfps_strict(point, nfps)
+        })
+        .collect();
+
+    // Score each candidate by the bbox area after placement
+    valid_candidates.into_iter().min_by(|&(ax, ay), &(bx, by)| {
+        let score = |x: f64, y: f64| -> f64 {
+            let new_min_x = ex_min_x.min(x + pdx_min);
+            let new_min_y = ex_min_y.min(y + pdy_min);
+            let new_max_x = ex_max_x.max(x + pdx_max);
+            let new_max_y = ex_max_y.max(y + pdy_max);
+            (new_max_x - new_min_x) * (new_max_y - new_min_y)
+        };
+        score(ax, ay)
+            .partial_cmp(&score(bx, by))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
 /// Computes the bounding box of an NFP.
 fn ifp_bounding_box(ifp: &Nfp) -> (f64, f64, f64, f64) {
     let mut min_x = f64::INFINITY;

@@ -10,7 +10,8 @@ use crate::geometry::Geometry2D;
 #[cfg(feature = "milp")]
 use crate::milp_solver::run_milp_nesting;
 use crate::nfp::{
-    compute_ifp_with_margin, compute_nfp, find_bottom_left_placement, rotate_nfp, translate_nfp,
+    compute_ifp_with_margin, compute_nfp, find_bottom_left_placement, find_min_bbox_placement,
+    rotate_nfp, translate_nfp,
     Nfp, NfpCache, PlacedGeometry,
 };
 #[cfg(feature = "milp")]
@@ -428,7 +429,26 @@ impl Nester2D {
             rotations
         };
 
+        // Pre-compute existing bounding box (unchanged across rotation candidates)
+        let existing_bbox: Option<(f64, f64, f64, f64)> = if placed.is_empty() {
+            None
+        } else {
+            let mut mn_x = f64::INFINITY;
+            let mut mn_y = f64::INFINITY;
+            let mut mx_x = f64::NEG_INFINITY;
+            let mut mx_y = f64::NEG_INFINITY;
+            for p in placed {
+                let ([dx0, dy0], [dx1, dy1]) = p.geometry.aabb_at_rotation(p.rotation);
+                mn_x = mn_x.min(p.position.0 + dx0);
+                mn_y = mn_y.min(p.position.1 + dy0);
+                mx_x = mx_x.max(p.position.0 + dx1);
+                mx_y = mx_y.max(p.position.1 + dy1);
+            }
+            Some((mn_x, mn_y, mx_x, mx_y))
+        };
+
         let mut best_placement: Option<(f64, f64, f64)> = None;
+        let mut best_bbox_area = f64::INFINITY;
 
         for &rotation in &rotation_angles {
             let ifp = match compute_ifp_with_margin(&boundary_polygon, geom, rotation, margin) {
@@ -459,12 +479,28 @@ impl Nester2D {
 
             let ifp_shrunk = self.shrink_ifp(&ifp, spacing);
             let nfp_refs: Vec<&Nfp> = nfps.iter().collect();
-            if let Some((x, y)) = find_bottom_left_placement(&ifp_shrunk, &nfp_refs, sample_step) {
-                let is_better = match best_placement {
-                    None => true,
-                    Some((bx, by, _)) => x < bx - 1e-6 || (x < bx + 1e-6 && y < by - 1e-6),
+            let part_aabb = geom.aabb_at_rotation(rotation);
+            if let Some((x, y)) = find_min_bbox_placement(
+                &ifp_shrunk,
+                &nfp_refs,
+                sample_step,
+                existing_bbox,
+                part_aabb,
+            ) {
+                // Compute resulting bbox area for cross-rotation comparison
+                let ([pdx0, pdy0], [pdx1, pdy1]) = part_aabb;
+                let area = match existing_bbox {
+                    None => (pdx1 - pdx0) * (pdy1 - pdy0),
+                    Some((ex0, ey0, ex1, ey1)) => {
+                        let nx0 = ex0.min(x + pdx0);
+                        let ny0 = ey0.min(y + pdy0);
+                        let nx1 = ex1.max(x + pdx1);
+                        let ny1 = ey1.max(y + pdy1);
+                        (nx1 - nx0) * (ny1 - ny0)
+                    }
                 };
-                if is_better {
+                if area < best_bbox_area - 1e-6 {
+                    best_bbox_area = area;
                     best_placement = Some((x, y, rotation));
                 }
             }
@@ -525,11 +561,35 @@ impl Nester2D {
 
         let ifp_shrunk = self.shrink_ifp(&ifp, spacing);
         let nfp_refs: Vec<&Nfp> = nfps.iter().collect();
-        if let Some((x, y)) = find_bottom_left_placement(&ifp_shrunk, &nfp_refs, sample_step) {
-            let geom_aabb = geom.aabb_at_rotation(rotation);
+        let part_aabb = geom.aabb_at_rotation(rotation);
+
+        let existing_bbox: Option<(f64, f64, f64, f64)> = if placed.is_empty() {
+            None
+        } else {
+            let mut mn_x = f64::INFINITY;
+            let mut mn_y = f64::INFINITY;
+            let mut mx_x = f64::NEG_INFINITY;
+            let mut mx_y = f64::NEG_INFINITY;
+            for p in placed {
+                let ([dx0, dy0], [dx1, dy1]) = p.geometry.aabb_at_rotation(p.rotation);
+                mn_x = mn_x.min(p.position.0 + dx0);
+                mn_y = mn_y.min(p.position.1 + dy0);
+                mx_x = mx_x.max(p.position.0 + dx1);
+                mx_y = mx_y.max(p.position.1 + dy1);
+            }
+            Some((mn_x, mn_y, mx_x, mx_y))
+        };
+
+        if let Some((x, y)) = find_min_bbox_placement(
+            &ifp_shrunk,
+            &nfp_refs,
+            sample_step,
+            existing_bbox,
+            part_aabb,
+        ) {
             let boundary_aabb = boundary.aabb();
             if let Some((cx, cy)) =
-                clamp_placement_to_boundary_with_margin(x, y, geom_aabb, boundary_aabb, margin)
+                clamp_placement_to_boundary_with_margin(x, y, part_aabb, boundary_aabb, margin)
             {
                 return Ok(Some((cx, cy, rotation)));
             }
