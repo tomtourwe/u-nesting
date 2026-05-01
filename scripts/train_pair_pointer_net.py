@@ -352,7 +352,7 @@ def _ppo_loss(
     if rot_entropies:
         rot_entropy = torch.stack(rot_entropies).mean() / math.log(max(n_rotations, 2))
         total = total - rot_entropy_coef * rot_entropy
-    return total, part_entropy, imitation_loss, rot_entropy
+    return total, part_entropy, imitation_loss, rot_entropy, policy_loss
 
 
 def _run_greedy_eval(
@@ -498,6 +498,7 @@ def _log_training_step(
     stats: dict,
     episode_time: float,
     rot_entropy: torch.Tensor | None = None,
+    policy_loss: torch.Tensor | None = None,
 ) -> None:
     n_placed = env.n_placed()
 
@@ -543,6 +544,8 @@ def _log_training_step(
     }
     if rot_entropy is not None:
         log_dict["loss/rot_entropy"] = rot_entropy.item()
+    if policy_loss is not None:
+        log_dict["loss/policy"] = policy_loss.item()
     wandb.log(log_dict, step=episode + 1)
 
 _log_training_step._prev_misses  = 0
@@ -833,7 +836,7 @@ def train(args: argparse.Namespace) -> None:
 
             for _ in range(args.ppo_epochs):
                 optimizer.zero_grad(set_to_none=True)
-                epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = 0.0
+                epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = epoch_policy = 0.0
 
                 for start in range(0, N_total, mini_bs):
                     chunk_obs = batch_observations[start : start + mini_bs]
@@ -843,7 +846,7 @@ def train(args: argparse.Namespace) -> None:
                     new_lp, new_ent, new_rot_ent, new_imit = _evaluate_actions(
                         model, chunk_obs, device)
 
-                    chunk_loss, ent_b, imit_l, rot_e = _ppo_loss(
+                    chunk_loss, ent_b, imit_l, rot_e, pol_l = _ppo_loss(
                         chunk_old, new_lp, new_ent, new_imit, chunk_adv,
                         entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
                         rot_entropies=new_rot_ent,
@@ -858,10 +861,11 @@ def train(args: argparse.Namespace) -> None:
                     scale = len(chunk_obs) / N_total
                     (chunk_loss * scale).backward()
 
-                    epoch_loss    += chunk_loss.item() * scale
-                    epoch_ent     += ent_b.item() * scale
-                    epoch_imit    += imit_l.item() * scale
+                    epoch_loss   += chunk_loss.item() * scale
+                    epoch_ent    += ent_b.item() * scale
+                    epoch_imit   += imit_l.item() * scale
                     epoch_rot_ent += rot_e.item() * scale
+                    epoch_policy += pol_l.item() * scale
 
                 if nan_break:
                     loss = torch.tensor(0.0)
@@ -874,6 +878,7 @@ def train(args: argparse.Namespace) -> None:
                 entropy_bonus  = torch.tensor(epoch_ent)
                 imitation_loss = torch.tensor(epoch_imit)
                 rot_entropy    = torch.tensor(epoch_rot_ent)
+                policy_loss    = torch.tensor(epoch_policy)
 
             batch_log_probs.clear()
             batch_entropies.clear()
@@ -884,12 +889,12 @@ def train(args: argparse.Namespace) -> None:
         else:
             entropy_coef   = _current_entropy_coef(episode, args)
             imitation_coef = _current_imitation_coef(episode, args)
-            loss = entropy_bonus = imitation_loss = rot_entropy = torch.tensor(0.0)
+            loss = entropy_bonus = imitation_loss = rot_entropy = policy_loss = torch.tensor(0.0)
 
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
                            imitation_loss, imitation_coef, stats, episode_time,
-                           rot_entropy=rot_entropy)
+                           rot_entropy=rot_entropy, policy_loss=policy_loss)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(
