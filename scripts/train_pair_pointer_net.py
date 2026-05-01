@@ -813,11 +813,13 @@ def train(args: argparse.Namespace) -> None:
     batch_advantages:   list = []
     batch_observations: list = []
 
-    # Same-config multi-rollout tracking
-    config_rollout_idx: int       = 0
-    cfg_step_counts:    list[int] = []
+    # Same-config multi-rollout tracking (best-of-K selection)
+    config_rollout_idx: int  = 0
     current_lib_ids:    list[int] | None = None
-    n_parts_ep:         int       = 0
+    n_parts_ep:         int  = 0
+    # Buffer for K rollouts of the same config; each entry is
+    # (episode_reward, log_probs, entropies, rot_entropies, advantages, observations)
+    cfg_rollouts: list[tuple] = []
 
     for episode in range(args.episodes):
         t0 = time.perf_counter()
@@ -835,27 +837,19 @@ def train(args: argparse.Namespace) -> None:
                 gae_lambda=args.gae_lambda, rotations_rad=rotations_rad,
             )
 
-        # Accumulate rollout data
-        batch_log_probs.extend(log_probs)
-        batch_entropies.extend(entropies)
-        batch_rot_ents.extend(rot_entropies)
-        batch_advantages.extend(advantages)
-        batch_observations.extend(observations)
-
-        # Within-config advantage normalization: after K rollouts of the same config,
-        # retroactively normalize their advantages in batch_ to remove config-difficulty
-        # variance and isolate policy-quality signal.
-        cfg_step_counts.append(len(advantages))
+        cfg_rollouts.append((reward, log_probs, entropies, rot_entropies, advantages, observations))
         config_rollout_idx += 1
+
         if config_rollout_idx == args.rollouts_per_config:
-            n_cfg_steps = sum(cfg_step_counts)
-            adv_slice   = np.array(batch_advantages[-n_cfg_steps:], dtype=np.float32)
-            adv_std     = float(adv_slice.std())
-            if adv_std > 1e-8:
-                batch_advantages[-n_cfg_steps:] = (
-                    (adv_slice - adv_slice.mean()) / adv_std
-                ).tolist()
-            cfg_step_counts.clear()
+            # Pick the rollout with the highest episode reward (= best packing density)
+            best = max(cfg_rollouts, key=lambda x: x[0])
+            _, b_lp, b_ent, b_rot, b_adv, b_obs = best
+            batch_log_probs.extend(b_lp)
+            batch_entropies.extend(b_ent)
+            batch_rot_ents.extend(b_rot)
+            batch_advantages.extend(b_adv)
+            batch_observations.extend(b_obs)
+            cfg_rollouts.clear()
             config_rollout_idx = 0
 
         entropy_coef   = _current_entropy_coef(episode, args)
@@ -940,7 +934,7 @@ def train(args: argparse.Namespace) -> None:
             batch_rot_ents.clear()
             batch_advantages.clear()
             batch_observations.clear()
-            cfg_step_counts.clear()
+            cfg_rollouts.clear()
             config_rollout_idx = 0
             current_lib_ids    = None
         else:
