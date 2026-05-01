@@ -256,11 +256,14 @@ def _run_episode(
     episode_reward = env.packing_density()
     board_area     = env.plate_w * env.plate_h
 
+    vp_list = [v.item() for v in value_preds_ep]
     stats = {
         "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list else 0.0,
         "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list else 0.0,
         "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list else 0.0,
-        "value_mean":         float(np.mean([v.item() for v in value_preds_ep])) if value_preds_ep else 0.0,
+        "value_mean":         float(np.mean(vp_list))   if vp_list else 0.0,
+        "value_std":          float(np.std(vp_list))    if vp_list else 0.0,
+        "value_step_decay":   float(vp_list[0] - vp_list[-1]) if len(vp_list) >= 2 else 0.0,
         "bbox_frac":          env.bbox_area() / board_area,
     }
 
@@ -585,6 +588,8 @@ def _log_training_step(
         "value/explained_variance": val_expl_var,
         "value/mean_pred":          stats["value_mean"],
         "value/mean_target":        val_mean_target,
+        "value/pred_std":           stats["value_std"],
+        "value/step_decay":         stats["value_step_decay"],
         "loss/value":               value_loss.item() if value_loss is not None else 0.0,
         # Policy losses
         "loss/total":               loss.item(),
@@ -761,12 +766,14 @@ def train(args: argparse.Namespace) -> None:
         f"               ema rises → agent is learning to nest more densely.\n"
         f"               Typical greedy baseline: ~0.35–0.45 for aligners.\n"
         f"\n"
-        f"  ev=X         Value explained variance (−∞ to 1).\n"
-        f"               How well the value network predicts future returns:\n"
-        f"                 > 0.5  good — value net is genuinely helping PPO\n"
-        f"                 ~ 0    bad  — predicting the mean, no useful signal\n"
-        f"                 < 0    broken — worse than a constant, check lr/arch\n"
-        f"               Expect low/negative early; should rise within ~500 eps.\n"
+        f"  ev=X         Value explained variance (−∞ to 1). Weak signal here because\n"
+        f"               density targets have naturally low variance (narrow range).\n"
+        f"               Watch value/pred_std and value/step_decay in wandb instead:\n"
+        f"                 pred_std  → std of V(s) across steps in an episode.\n"
+        f"                             Near 0 = predicting same value for every state (bad).\n"
+        f"                             Growing = learning state-dependent structure (good).\n"
+        f"                 step_decay → V(s_first) − V(s_last). Should be ≈ total episode\n"
+        f"                             return (~0.4). Near 0 = not learning step progression.\n"
         f"\n"
         f"  loss=X       Total PPO loss (policy + value + entropy + imitation).\n"
         f"               Should decrease early then plateau — large spikes = instability.\n"
