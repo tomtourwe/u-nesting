@@ -728,8 +728,6 @@ def train(args: argparse.Namespace) -> None:
         args.n_parts_start = args.n_parts
     if args.curriculum_episodes is None:
         args.curriculum_episodes = args.episodes
-    if args.imitation_episodes is None:
-        args.imitation_episodes = args.curriculum_episodes
     if args.out_best is None:
         args.out_best = f"data/{args.model}_pointer_net_best.pt"
     if args.out_last is None:
@@ -915,8 +913,8 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--ppo-epochs",          type=int,   default=4)
     p.add_argument("--imitation-coef",        type=float, default=0.3,
                    help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
-    p.add_argument("--imitation-episodes",   type=int,   default=None,
-                   help="Episodes over which imitation coef decays to 0 (default: curriculum_episodes).")
+    p.add_argument("--imitation-episodes",   type=int,   default=500,
+                   help="Episodes over which imitation coef decays to 0.")
     p.add_argument("--gae-lambda",           type=float, default=0.95,
                    help="GAE lambda for advantage estimation (default 0.95).")
     p.add_argument("--value-coef",           type=float, default=0.5,
