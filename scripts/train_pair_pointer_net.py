@@ -617,6 +617,7 @@ def _log_eval_set(
     args: argparse.Namespace,
     episode: int,
     rotations_rad: list[float] | None = None,
+    greedy_cache: dict | None = None,
 ) -> float:
     n = len(eval_configs)
     print(f"[eval]  ep={episode+1:>5}/{args.episodes}  {n} configs …", end="", flush=True)
@@ -633,14 +634,17 @@ def _log_eval_set(
     worst_n_placed = worst_n_placed_fb = worst_n_greedy = 0
     worst_greedy_density = 0.0
 
-    for lib_ids in eval_configs:
+    for i, lib_ids in enumerate(eval_configs):
         pure_density, fb_density, snapshots, n_placed, n_placed_fb, unplaced_polys = _run_greedy_eval(
             env, model, lib_ids, device, args, rotations_rad=rotations_rad,
         )
-        env.reset(lib_ids)
-        n_greedy       = env.place_remaining()
-        greedy_polys   = env.placed_polygons()
-        greedy_density = env.packing_density()
+        if greedy_cache is not None and i in greedy_cache:
+            greedy_density, greedy_polys, n_greedy = greedy_cache[i]
+        else:
+            env.reset(lib_ids)
+            n_greedy       = env.place_remaining()
+            greedy_polys   = env.placed_polygons()
+            greedy_density = env.packing_density()
 
         ratio_pure = pure_density / greedy_density if greedy_density > 0 else float("nan")
         ratio_fb   = fb_density   / greedy_density if greedy_density > 0 else float("nan")
@@ -740,6 +744,15 @@ def train(args: argparse.Namespace) -> None:
     n_eval_parts = args.n_eval_parts if args.n_eval_parts is not None else args.n_parts
     eval_configs = [env.sample_episode_ids(n=n_eval_parts, rng=eval_rng)
                     for _ in range(args.n_eval_configs)]
+
+    # Precompute greedy baseline for each eval config once — it never changes.
+    print("Precomputing greedy baselines for eval configs … ", end="", flush=True)
+    greedy_cache: dict[int, tuple] = {}  # config index → (density, polys, n_placed)
+    for i, lib_ids in enumerate(eval_configs):
+        env.reset(lib_ids)
+        n_placed       = env.place_remaining()
+        greedy_cache[i] = (env.packing_density(), env.placed_polygons(), n_placed)
+    print("done")
     fixed_lib_ids = (env.sample_episode_ids(n=args.n_parts, rng=rng)
                      if args.fixed_parts else None)
 
@@ -962,6 +975,7 @@ def train(args: argparse.Namespace) -> None:
             last_eval_density = _log_eval_set(
                 env, model, eval_configs, device, args, episode,
                 rotations_rad=rotations_rad,
+                greedy_cache=greedy_cache,
             )
 
         if last_eval_density > best_density:
