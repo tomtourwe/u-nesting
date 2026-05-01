@@ -228,18 +228,16 @@ def _run_episode(
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
 
-    # Compute GAE advantages and value targets (bootstrap V=0 at terminal)
-    T = len(R_t_list)
-    A_t_list        = [0.0] * T
-    value_targets_ep = [0.0] * T
-    gae = 0.0
-    for t in reversed(range(T)):
-        v_t    = value_preds_ep[t].item() if t < len(value_preds_ep) else 0.0
-        v_next = value_preds_ep[t + 1].item() if t + 1 < len(value_preds_ep) else 0.0
-        delta  = R_t_list[t] + gamma * v_next - v_t
-        gae    = delta + gamma * gae_lambda * gae
-        A_t_list[t]         = gae
-        value_targets_ep[t] = v_t + gae
+    # REINFORCE with baseline: every step gets the same return (final density),
+    # minus the value baseline to reduce variance.  No credit assignment —
+    # good episodes reinforce all their decisions equally.
+    final_density    = env.packing_density()
+    T                = len(R_t_list)
+    value_targets_ep = [final_density] * T
+    A_t_list         = [
+        final_density - (value_preds_ep[t].item() if t < len(value_preds_ep) else 0.0)
+        for t in range(T)
+    ]
 
     # Attach value targets to stored observations
     if not greedy and observations:
@@ -248,7 +246,7 @@ def _run_episode(
             for obs, vt in zip(observations, value_targets_ep)
         ]
 
-    episode_reward = env.packing_density()
+    episode_reward = final_density
     board_area     = env.plate_w * env.plate_h
 
     vp_list = [v.item() for v in value_preds_ep]
