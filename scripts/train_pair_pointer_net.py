@@ -786,9 +786,11 @@ def train(args: argparse.Namespace) -> None:
         f"\n"
         f"  [eval]       Runs every {args.eval_interval} eps on fixed configs.\n"
         f"               agent=X(Rx)   density from agent placements only, ratio vs greedy.\n"
-        f"               +autofill=X   density after engine greedily fills remaining gaps.\n"
+        f"               +autofill=X   density after engine greedily fills what the agent left.\n"
         f"               greedy=X      pure greedy baseline (no agent) on same configs.\n"
-        f"               placed=A/B vs G  parts placed: agent / agent+autofill vs greedy.\n"
+        f"               placed=A/B vs G  avg parts placed across {args.n_eval_configs} configs:\n"
+        f"                              A = agent only, B = agent+autofill, G = greedy.\n"
+        f"                              Decimals are averages (e.g. 5.2 = avg of 5,5,6,5,... runs).\n"
         f"               Rx > 1.0 → agent beats greedy — the goal.\n"
         f"─────────────────────────────────────────────────────────────────────\n"
     )
