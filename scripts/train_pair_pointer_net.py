@@ -294,8 +294,9 @@ def _build_model_and_optimizer(
         model = SplitPointerNet().to(device)
     if device.type == "cuda":
         # ~30–60% faster on NVIDIA; not supported on MPS
+        torch.set_float32_matmul_precision("high")
         model = torch.compile(model)
-        print("torch.compile enabled (CUDA)")
+        print("torch.compile enabled (CUDA), TF32 matmul enabled")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     return model, optimizer
 
