@@ -233,10 +233,7 @@ def _run_episode(
     board_area     = env.plate_w * env.plate_h
 
     stats = {
-        "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list else 0.0,
-        "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list else 0.0,
-        "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list else 0.0,
-        "bbox_frac":          env.bbox_area() / board_area,
+        "bbox_frac": env.bbox_area() / board_area,
     }
 
     return log_probs, entropies, rot_entropies, A_t_list, episode_reward, snapshots, stats, observations
@@ -544,13 +541,10 @@ def _log_training_step(
         "agent/density_ema":        density_ema,
         "agent/parts_placed":       n_placed / n_parts_ep,
         # Policy losses
-        "loss/total":               loss.item(),
-        "loss/entropy":             entropy_bonus.item(),
-        "loss/imitation":           imitation_loss.item(),
-        "loss/imitation_coef":      imitation_coef,
-        # Advantage signal
-        "train/advantage_mean":     stats["advantage_mean"],
-        "train/advantage_pos_frac": stats["advantage_pos_frac"],
+        "loss/total":          loss.item(),
+        "loss/entropy":        entropy_bonus.item(),
+        "loss/imitation":      imitation_loss.item(),
+        "loss/imitation_coef": imitation_coef,
         # Performance
         "perf/episode_time_s":      episode_time,
         "cache/hit_rate":           ep_hit_rate,
@@ -800,9 +794,10 @@ def train(args: argparse.Namespace) -> None:
             # Use best and worst rollouts of this config.
             # Best gets positive advantage, worst gets negative — providing contrast.
             # Advantage = episode_density - mean_density (same scalar for all steps).
-            mean_density = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
-            best  = max(cfg_rollouts, key=lambda x: x[0])
-            worst = min(cfg_rollouts, key=lambda x: x[0])
+            mean_density  = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
+            best          = max(cfg_rollouts, key=lambda x: x[0])
+            worst         = min(cfg_rollouts, key=lambda x: x[0])
+            spread        = best[0] - worst[0]
             for rollout in [best, worst]:
                 density, r_lp, r_ent, r_rot, _, r_obs = rollout
                 adv = density - mean_density  # best: positive, worst: negative
@@ -812,6 +807,15 @@ def train(args: argparse.Namespace) -> None:
                 batch_rot_ents.extend(r_rot)
                 batch_advantages.extend(r_adv)
                 batch_observations.extend(r_obs)
+            wandb.log({
+                "config/best_density":   best[0],
+                "config/worst_density":  worst[0],
+                "config/mean_density":   mean_density,
+                "config/spread":         spread,
+                "config/adv_best":       best[0]  - mean_density,
+                "config/adv_worst":      worst[0] - mean_density,
+            }, step=episode + 1)
+            print(f"  → config: best={best[0]:.4f}  worst={worst[0]:.4f}  spread={spread:.4f}")
             cfg_rollouts.clear()
             config_rollout_idx = 0
 
@@ -831,6 +835,10 @@ def train(args: argparse.Namespace) -> None:
                 ((adv_arr - adv_arr.mean()) / (adv_std + 1e-8)).tolist()
                 if adv_std > 1e-8 else batch_advantages
             )
+            wandb.log({
+                "train/batch_adv_std":      adv_std,
+                "train/batch_adv_pos_frac": float(np.mean([a > 0 for a in batch_advantages])),
+            }, step=episode + 1)
 
             mini_bs   = args.ppo_mini_batch if args.ppo_mini_batch > 0 else N_total
             nan_break = False
