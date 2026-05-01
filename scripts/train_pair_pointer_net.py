@@ -228,16 +228,13 @@ def _run_episode(
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
 
-    # REINFORCE with baseline: every step gets the same return (final density),
-    # minus the value baseline to reduce variance.  No credit assignment —
-    # good episodes reinforce all their decisions equally.
+    # Every step gets the full episode return (final density) as its advantage.
+    # The per-config baseline is subtracted later in the training loop, after
+    # all K rollouts of the same config have been collected.
     final_density    = env.packing_density()
     T                = len(R_t_list)
     value_targets_ep = [final_density] * T
-    A_t_list         = [
-        final_density - (value_preds_ep[t].item() if t < len(value_preds_ep) else 0.0)
-        for t in range(T)
-    ]
+    A_t_list         = [final_density] * T
 
     # Attach value targets to stored observations
     if not greedy and observations:
@@ -839,9 +836,14 @@ def train(args: argparse.Namespace) -> None:
         config_rollout_idx += 1
 
         if config_rollout_idx == args.rollouts_per_config:
-            # Pick the rollout with the highest episode reward (= best packing density)
+            # Per-config baseline: advantage = best_density - mean_density across K rollouts.
+            # Every step in the best episode gets the same scalar — no per-step credit
+            # assignment, just "this ordering beat the average by this much."
+            mean_density = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
             best = max(cfg_rollouts, key=lambda x: x[0])
-            _, b_lp, b_ent, b_rot, b_adv, b_obs = best
+            _, b_lp, b_ent, b_rot, _, b_obs = best
+            per_config_adv = best[0] - mean_density
+            b_adv = [per_config_adv] * len(b_lp)
             batch_log_probs.extend(b_lp)
             batch_entropies.extend(b_ent)
             batch_rot_ents.extend(b_rot)
