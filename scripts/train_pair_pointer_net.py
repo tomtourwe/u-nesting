@@ -839,37 +839,79 @@ def train(args: argparse.Namespace) -> None:
         if do_update and batch_log_probs:
             old_log_probs = [lp.detach() for lp in batch_log_probs]
             value_targets = [obs[5].item() for obs in batch_observations]
+            N_total = len(batch_observations)
+
+            # Normalize advantages over the full batch before splitting into mini-batches
+            adv_arr = np.array(batch_advantages, dtype=np.float32)
+            adv_std = float(adv_arr.std())
+            norm_adv: list[float] = (
+                ((adv_arr - adv_arr.mean()) / (adv_std + 1e-8)).tolist()
+                if adv_std > 1e-8 else batch_advantages
+            )
+
+            mini_bs = args.ppo_mini_batch if args.ppo_mini_batch > 0 else N_total
+            new_value_preds: list = []
+            nan_break = False
+
             for _ in range(args.ppo_epochs):
-                new_log_probs, new_entropies, new_rot_entropies, new_imitation, new_value_preds = _evaluate_actions(
-                    model, batch_observations, device)
-                loss, entropy_bonus, imitation_loss, rot_entropy, value_loss = _ppo_loss(
-                    old_log_probs, new_log_probs, new_entropies, new_imitation,
-                    batch_advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
-                    rot_entropies=new_rot_entropies,
-                    rot_entropy_coef=rot_entropy_coef,
-                    n_rotations=args.n_rotations,
-                    value_preds=new_value_preds,
-                    value_targets=value_targets,
-                    value_coef=args.value_coef,
-                )
-                if torch.isfinite(loss):
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                else:
+                optimizer.zero_grad(set_to_none=True)
+                epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = epoch_val = 0.0
+                all_vp: list = []
+
+                for start in range(0, N_total, mini_bs):
+                    chunk_obs = batch_observations[start : start + mini_bs]
+                    chunk_old = old_log_probs[start : start + mini_bs]
+                    chunk_adv = norm_adv[start : start + mini_bs]
+                    chunk_vt  = [obs[5].item() for obs in chunk_obs]
+
+                    new_lp, new_ent, new_rot_ent, new_imit, new_vp = _evaluate_actions(
+                        model, chunk_obs, device)
+                    all_vp.extend(new_vp)
+
+                    chunk_loss, ent_b, imit_l, rot_e, val_l = _ppo_loss(
+                        chunk_old, new_lp, new_ent, new_imit, chunk_adv,
+                        entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
+                        rot_entropies=new_rot_ent,
+                        rot_entropy_coef=rot_entropy_coef,
+                        n_rotations=args.n_rotations,
+                        value_preds=new_vp,
+                        value_targets=chunk_vt,
+                        value_coef=args.value_coef,
+                    )
+
+                    if not torch.isfinite(chunk_loss):
+                        nan_break = True
+                        break
+
+                    scale = len(chunk_obs) / N_total
+                    (chunk_loss * scale).backward()
+
+                    epoch_loss    += chunk_loss.item() * scale
+                    epoch_ent     += ent_b.item() * scale
+                    epoch_imit    += imit_l.item() * scale
+                    epoch_rot_ent += rot_e.item() * scale
+                    epoch_val     += val_l.item() * scale
+
+                if nan_break:
                     loss = torch.tensor(0.0)
                     break
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                loss           = torch.tensor(epoch_loss)
+                entropy_bonus  = torch.tensor(epoch_ent)
+                imitation_loss = torch.tensor(epoch_imit)
+                rot_entropy    = torch.tensor(epoch_rot_ent)
+                value_loss     = torch.tensor(epoch_val)
+                new_value_preds = all_vp  # last epoch's preds used for EV logging
+
             # Clear accumulators
             batch_log_probs.clear()
             batch_entropies.clear()
             batch_rot_ents.clear()
             batch_advantages.clear()
             batch_observations.clear()
-        elif not do_update:
-            loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
-            new_value_preds = []
-            value_targets   = []
         else:
             loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
             new_value_preds = []
@@ -939,6 +981,9 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--ppo-epochs",          type=int,   default=4)
     p.add_argument("--episodes-per-update", type=int,   default=4,
                    help="Accumulate this many episodes before each PPO update (default 4).")
+    p.add_argument("--ppo-mini-batch",      type=int,   default=0,
+                   help="Mini-batch size within each PPO epoch (0 = full batch, default 0). "
+                        "Set e.g. 16 on GPU to avoid OOM when episodes-per-update is large.")
     p.add_argument("--imitation-coef",        type=float, default=0.3,
                    help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
     p.add_argument("--imitation-episodes",   type=int,   default=500,
