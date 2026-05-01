@@ -813,10 +813,21 @@ def train(args: argparse.Namespace) -> None:
     batch_advantages:   list = []
     batch_observations: list = []
 
+    # Same-config multi-rollout tracking
+    config_rollout_idx: int       = 0
+    cfg_step_counts:    list[int] = []
+    current_lib_ids:    list[int] | None = None
+    n_parts_ep:         int       = 0
+
     for episode in range(args.episodes):
-        t0         = time.perf_counter()
-        n_parts_ep = _curriculum_n_parts(episode, args)
-        lib_ids    = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
+        t0 = time.perf_counter()
+
+        # Sample a new config only at the start of each config group
+        if config_rollout_idx == 0:
+            n_parts_ep      = _curriculum_n_parts(episode, args)
+            current_lib_ids = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
+        lib_ids = current_lib_ids
+
         model.train()
         with torch.no_grad():
             log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
@@ -830,6 +841,22 @@ def train(args: argparse.Namespace) -> None:
         batch_rot_ents.extend(rot_entropies)
         batch_advantages.extend(advantages)
         batch_observations.extend(observations)
+
+        # Within-config advantage normalization: after K rollouts of the same config,
+        # retroactively normalize their advantages in batch_ to remove config-difficulty
+        # variance and isolate policy-quality signal.
+        cfg_step_counts.append(len(advantages))
+        config_rollout_idx += 1
+        if config_rollout_idx == args.rollouts_per_config:
+            n_cfg_steps = sum(cfg_step_counts)
+            adv_slice   = np.array(batch_advantages[-n_cfg_steps:], dtype=np.float32)
+            adv_std     = float(adv_slice.std())
+            if adv_std > 1e-8:
+                batch_advantages[-n_cfg_steps:] = (
+                    (adv_slice - adv_slice.mean()) / adv_std
+                ).tolist()
+            cfg_step_counts.clear()
+            config_rollout_idx = 0
 
         entropy_coef   = _current_entropy_coef(episode, args)
         imitation_coef = _current_imitation_coef(episode, args)
@@ -906,12 +933,16 @@ def train(args: argparse.Namespace) -> None:
                 value_loss     = torch.tensor(epoch_val)
                 new_value_preds = all_vp  # last epoch's preds used for EV logging
 
-            # Clear accumulators
+            # Clear accumulators; also reset config-group tracking so the next
+            # episode starts a fresh group (policy has changed after the update).
             batch_log_probs.clear()
             batch_entropies.clear()
             batch_rot_ents.clear()
             batch_advantages.clear()
             batch_observations.clear()
+            cfg_step_counts.clear()
+            config_rollout_idx = 0
+            current_lib_ids    = None
         else:
             loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
             new_value_preds = []
@@ -981,6 +1012,10 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--ppo-epochs",          type=int,   default=4)
     p.add_argument("--episodes-per-update", type=int,   default=4,
                    help="Accumulate this many episodes before each PPO update (default 4).")
+    p.add_argument("--rollouts-per-config", type=int,   default=1,
+                   help="Run this many rollouts on the same parts config before sampling a new one (default 1). "
+                        "Within-group advantage normalization removes config-difficulty variance, "
+                        "leaving only policy-quality signal.")
     p.add_argument("--ppo-mini-batch",      type=int,   default=0,
                    help="Mini-batch size within each PPO epoch (0 = full batch, default 0). "
                         "Set e.g. 16 on GPU to avoid OOM when episodes-per-update is large.")
