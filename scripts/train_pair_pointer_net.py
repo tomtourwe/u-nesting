@@ -340,12 +340,12 @@ def _evaluate_actions(
 
             if rot_feats is not None and rot_id is not None and hasattr(model, "rotation_head"):
                 rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
-                rot_dist   = Categorical(logits=rot_logits)
+                rot_dist   = Categorical(logits=rot_logits.float())
                 rot_entropies.append(rot_dist.entropy())
             else:
                 rot_logits = rot_dist = None
 
-        part_dist = Categorical(logits=part_logits)
+        part_dist = Categorical(logits=part_logits.float())
         lp        = part_dist.log_prob(part_id)
         part_entropies.append(part_dist.entropy())
 
@@ -354,9 +354,9 @@ def _evaluate_actions(
 
         log_probs.append(lp)
         imitation_losses.append(
-            F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device, non_blocking=True))
+            F.cross_entropy(part_logits.float().unsqueeze(0), greedy_target.unsqueeze(0).to(device, non_blocking=True))
         )
-        value_preds.append(value if value is not None else torch.tensor(0.0, device=device))
+        value_preds.append(value.float() if value is not None else torch.tensor(0.0, device=device))
     return log_probs, part_entropies, rot_entropies, imitation_losses, value_preds
 
 
