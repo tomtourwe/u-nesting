@@ -427,17 +427,7 @@ def _run_greedy_eval(
     if n_fallback > 0:
         snapshots.append((env.placed_polygons(), fallback_density))
 
-    remaining      = env.remaining_item_ids()
-    unplaced_polys = []
-    for ep_id in remaining:
-        ep_geoms = env._episode_geoms()
-        if ep_id < len(ep_geoms):
-            geom_id  = ep_geoms[ep_id]["id"]
-            previews = env._board.preview_all([geom_id])
-            if previews and previews[0] is not None:
-                unplaced_polys.append(previews[0])
-
-    return pure_density, fallback_density, snapshots, n_placed_pure, n_placed_fallback, unplaced_polys
+    return pure_density, fallback_density, snapshots, n_placed_pure, n_placed_fallback, []
 
 
 def _make_eval_figure(
