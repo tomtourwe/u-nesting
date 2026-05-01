@@ -25,9 +25,9 @@ Episode loop
        c. Sample part_id ~ Categorical(part_logits).
        d. Ask U-Nesting to place the part.
   3. Per-step reward: R_t = packing_density(s_{t+1}) − packing_density(s_t)
-     Value baseline: V(s) = packing density a greedy rollout achieves from s
-     Advantage: A_t = R_t + γ·V(s_{t+1}) − V(s_t)
-  4. Loss = PPO_loss − entropy_coef·entropy
+     Value baseline: V(s) = neural value head on SplitPointerNet, trained on actual returns
+     Advantage: GAE(λ=0.95) using actual rewards and bootstrapped values
+  4. Loss = PPO_loss − entropy_coef·entropy + value_coef·MSE(V_pred, V_target)
 
 Usage:
     maturin develop --release --features python-bindings
@@ -35,6 +35,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import math
 import random
 import sys
@@ -66,6 +67,16 @@ def _device() -> torch.device:
     return torch.device("cpu")
 
 
+def _autocast(device: torch.device):
+    """
+    bfloat16 autocast on CUDA (Ampere+ gets Tensor Core speedup, no GradScaler needed).
+    No-op on MPS (limited op coverage) and CPU.
+    """
+    if device.type == "cuda":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 def _curriculum_n_parts(episode: int, args: argparse.Namespace) -> int:
     if args.n_parts_start >= args.n_parts:
         return args.n_parts
@@ -89,13 +100,17 @@ def _sample_action(
     """
     Sample a (part, rotation) action from the model.
 
-    Returns (part_id, part_dist, part_logits, rot_id, rot_dist).
-    rot_id / rot_dist are None when the model does not have a rotation_head
-    (e.g. SpatialPointerNet).
+    Returns (part_id, part_dist, part_logits, rot_id, rot_dist, value).
+    rot_id / rot_dist are None when the model does not have a rotation_head.
+    value is None when the model does not have a value_head.
     """
     output = model(obs_t, mask)
+    value = None
     if isinstance(output, tuple):
-        part_logits, rot_feats, ctx = output
+        if len(output) == 4:
+            part_logits, rot_feats, ctx, value = output
+        else:
+            part_logits, rot_feats, ctx = output
     else:
         part_logits, rot_feats, ctx = output, None, None
 
@@ -108,7 +123,7 @@ def _sample_action(
         rot_dist   = Categorical(logits=rot_logits)
         rot_id     = rot_logits.argmax() if greedy else rot_dist.sample()
 
-    return part_id, part_dist, part_logits, rot_id, rot_dist
+    return part_id, part_dist, part_logits, rot_id, rot_dist, value
 
 
 def _action_log_prob_and_entropy(
@@ -125,10 +140,6 @@ def _action_log_prob_and_entropy(
         lp      = lp + rot_dist.log_prob(rot_id)
         rot_ent = rot_dist.entropy()
     return lp, ent, rot_ent
-
-
-def _td_advantage(R_t: float, v_curr: float, v_next: float, gamma: float) -> float:
-    return R_t + gamma * v_next - v_curr
 
 
 def _polygon_area(polygon: list) -> float:
@@ -155,8 +166,8 @@ def _run_episode(
     device: torch.device,
     greedy: bool = False,
     gamma: float = 0.99,
+    gae_lambda: float = 0.95,
     capture_snapshots: bool = False,
-    value_interval: int = 1,
     rotations_rad: list[float] | None = None,
 ) -> tuple[list, list, list, list[float], float, list, dict, list]:
     env.reset(lib_ids)
@@ -168,16 +179,9 @@ def _run_episode(
     observations:   list[tuple]        = []
     snapshots:      list               = []
     R_t_list:       list[float]        = []
-    A_t_list:       list[float]        = []
-    v_rollout_list: list[float]        = []
+    value_preds_ep: list[torch.Tensor] = []
 
-    rollout_density_curr, n_rollout_curr = env.rollout_value()
-    v_curr               = rollout_density_curr
-    rollout_density_init = rollout_density_curr
-    n_rollout_placed_init = n_rollout_curr
-    prev_density         = env.packing_density()
-    step                 = 0
-
+    prev_density = env.packing_density()
     skip_ids: set[int] = set()
 
     for _ in range(n_parts):
@@ -191,9 +195,9 @@ def _run_episode(
             obs_np = env.preview_images_per_rotation(rotations_rad)
         else:
             obs_np = env.preview_pair_images()
-        obs_t = torch.from_numpy(obs_np).to(device)
+        obs_t = torch.from_numpy(obs_np).to(device, non_blocking=True)
 
-        part_id, part_dist, _, rot_id, rot_dist = _sample_action(model, obs_t, mask, greedy)
+        part_id, part_dist, _, rot_id, rot_dist, value = _sample_action(model, obs_t, mask, greedy)
 
         if rotations_rad is not None and rot_id is not None:
             success = env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
@@ -203,6 +207,10 @@ def _run_episode(
         if not success:
             skip_ids.add(part_id.item())
             continue
+
+        value_preds_ep.append(
+            value.detach() if value is not None else torch.tensor(0.0, device=device)
+        )
 
         if not greedy:
             lp, ent, rot_ent = _action_log_prob_and_entropy(
@@ -222,33 +230,38 @@ def _run_episode(
         prev_density = env.packing_density()
         R_t_list.append(R_t)
 
-        if step % value_interval == 0:
-            rollout_density_next, n_rollout_next = env.rollout_value()
-            v_next = rollout_density_next
-            n_rollout_curr = n_rollout_next
-        else:
-            v_next = v_curr  # reuse last known value
-
-        A_t = _td_advantage(R_t, v_curr, v_next, gamma)
-        A_t_list.append(A_t)
-        v_rollout_list.append(v_next)
-        v_curr = v_next
-        step  += 1
-
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
+
+    # Compute GAE advantages and value targets (bootstrap V=0 at terminal)
+    T = len(R_t_list)
+    A_t_list        = [0.0] * T
+    value_targets_ep = [0.0] * T
+    gae = 0.0
+    for t in reversed(range(T)):
+        v_t    = value_preds_ep[t].item() if t < len(value_preds_ep) else 0.0
+        v_next = value_preds_ep[t + 1].item() if t + 1 < len(value_preds_ep) else 0.0
+        delta  = R_t_list[t] + gamma * v_next - v_t
+        gae    = delta + gamma * gae_lambda * gae
+        A_t_list[t]         = gae
+        value_targets_ep[t] = v_t + gae
+
+    # Attach value targets to stored observations
+    if not greedy and observations:
+        observations = [
+            (*obs, torch.tensor(vt, dtype=torch.float32))
+            for obs, vt in zip(observations, value_targets_ep)
+        ]
 
     episode_reward = env.packing_density()
     board_area     = env.plate_w * env.plate_h
 
     stats = {
-        "rollout_density_init":  rollout_density_init,
-        "n_rollout_placed_init": n_rollout_placed_init,
-        "R_t_mean":              float(np.mean(R_t_list))                  if R_t_list       else 0.0,
-        "advantage_mean":        float(np.mean(A_t_list))                  if A_t_list       else 0.0,
-        "advantage_pos_frac":    float(np.mean([a > 0 for a in A_t_list])) if A_t_list       else 0.0,
-        "v_rollout_final":       v_rollout_list[-1]                         if v_rollout_list else rollout_density_init,
-        "bbox_frac":             env.bbox_area() / board_area,
+        "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list else 0.0,
+        "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list else 0.0,
+        "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list else 0.0,
+        "value_mean":         float(np.mean([v.item() for v in value_preds_ep])) if value_preds_ep else 0.0,
+        "bbox_frac":          env.bbox_area() / board_area,
     }
 
     return log_probs, entropies, rot_entropies, A_t_list, episode_reward, snapshots, stats, observations
@@ -276,6 +289,10 @@ def _build_model_and_optimizer(
         model = SpatialPointerNet().to(device)
     else:
         model = SplitPointerNet().to(device)
+    if device.type == "cuda":
+        # ~30–60% faster on NVIDIA; not supported on MPS
+        model = torch.compile(model)
+        print("torch.compile enabled (CUDA)")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     return model, optimizer
 
@@ -298,35 +315,45 @@ def _evaluate_actions(
     model: torch.nn.Module,
     observations: list[tuple],
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, part_entropies, rot_entropies, imitation_losses = [], [], [], []
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    log_probs, part_entropies, rot_entropies, imitation_losses, value_preds = [], [], [], [], []
     for obs_entry in observations:
-        obs_t, mask, part_id, rot_id, greedy_target = obs_entry
-        obs_t    = obs_t.to(device)
-        mask     = mask.to(device)
-        part_id  = part_id.to(device)
+        obs_t, mask, part_id, rot_id, greedy_target, _value_target = obs_entry
+        obs_t   = obs_t.to(device,   non_blocking=True)
+        mask    = mask.to(device,    non_blocking=True)
+        part_id = part_id.to(device, non_blocking=True)
 
-        output = model(obs_t, mask)
-        if isinstance(output, tuple):
-            part_logits, rot_feats, ctx = output
-        else:
-            part_logits, rot_feats, ctx = output, None, None
+        with _autocast(device):
+            output = model(obs_t, mask)
+            value = None
+            if isinstance(output, tuple):
+                if len(output) == 4:
+                    part_logits, rot_feats, ctx, value = output
+                else:
+                    part_logits, rot_feats, ctx = output
+            else:
+                part_logits, rot_feats, ctx = output, None, None
+
+            if rot_feats is not None and rot_id is not None and hasattr(model, "rotation_head"):
+                rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
+                rot_dist   = Categorical(logits=rot_logits)
+                rot_entropies.append(rot_dist.entropy())
+            else:
+                rot_logits = rot_dist = None
 
         part_dist = Categorical(logits=part_logits)
         lp        = part_dist.log_prob(part_id)
         part_entropies.append(part_dist.entropy())
 
-        if rot_feats is not None and rot_id is not None and hasattr(model, "rotation_head"):
-            rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
-            rot_dist   = Categorical(logits=rot_logits)
-            lp         = lp + rot_dist.log_prob(rot_id.to(device))
-            rot_entropies.append(rot_dist.entropy())
+        if rot_dist is not None:
+            lp = lp + rot_dist.log_prob(rot_id.to(device, non_blocking=True))
 
         log_probs.append(lp)
         imitation_losses.append(
-            F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device))
+            F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device, non_blocking=True))
         )
-    return log_probs, part_entropies, rot_entropies, imitation_losses
+        value_preds.append(value if value is not None else torch.tensor(0.0, device=device))
+    return log_probs, part_entropies, rot_entropies, imitation_losses, value_preds
 
 
 def _ppo_loss(
@@ -343,7 +370,10 @@ def _ppo_loss(
     rot_entropies: list[torch.Tensor] | None = None,
     rot_entropy_coef: float = 0.0,
     n_rotations: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    value_preds: list[torch.Tensor] | None = None,
+    value_targets: list[float] | None = None,
+    value_coef: float = 0.5,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     adv     = torch.tensor(advantages, dtype=torch.float32, device=device)
     old_lp  = torch.stack(old_log_probs).detach()
     new_lp  = torch.stack(new_log_probs)
@@ -357,7 +387,13 @@ def _ppo_loss(
     if rot_entropies:
         rot_entropy = torch.stack(rot_entropies).mean() / math.log(max(n_rotations, 2))
         total = total - rot_entropy_coef * rot_entropy
-    return total, part_entropy, imitation_loss, rot_entropy
+    value_loss = torch.tensor(0.0, device=device)
+    if value_preds and value_targets:
+        vp = torch.stack(value_preds)
+        vt = torch.tensor(value_targets, dtype=torch.float32, device=device)
+        value_loss = F.mse_loss(vp, vt)
+        total = total + value_coef * value_loss
+    return total, part_entropy, imitation_loss, rot_entropy, value_loss
 
 
 def _run_greedy_eval(
@@ -396,10 +432,11 @@ def _run_greedy_eval(
             mask = _build_remaining_mask(remaining, n_parts, device)
 
             # Phase 1: part selection via cheap pair images (N Rust calls)
-            obs_pair = torch.from_numpy(env.preview_pair_images()).to(device)
-            output   = model(obs_pair, mask)
+            obs_pair = torch.from_numpy(env.preview_pair_images()).to(device, non_blocking=True)
+            with _autocast(device):
+                output = model(obs_pair, mask)
             if isinstance(output, tuple):
-                part_logits, _, ctx = output
+                part_logits, _, ctx = output[0], output[1], output[2]  # ignore value at [3]
             else:
                 part_logits, ctx = output, None
 
@@ -407,13 +444,14 @@ def _run_greedy_eval(
 
             # Phase 2: rotation selection for chosen part only (R Rust calls)
             if rotations_rad is not None and ctx is not None and hasattr(model, "rotation_head"):
-                obs_part   = torch.from_numpy(
+                obs_part = torch.from_numpy(
                     env.preview_images_for_part(part_id, rotations_rad)
-                ).to(device)
-                rot_feats  = model.rotation_feats_for_part(obs_part)   # (R, 128)
-                rot_logits = model.rotation_head(ctx[part_id], rot_feats)
-                rot_id     = int(rot_logits.argmax().item())
-                success    = env.place_with_rotation(part_id, rotations_rad[rot_id])
+                ).to(device, non_blocking=True)
+                with _autocast(device):
+                    rot_feats  = model.rotation_feats_for_part(obs_part)   # (R, 128)
+                    rot_logits = model.rotation_head(ctx[part_id], rot_feats)
+                rot_id  = int(rot_logits.argmax().item())
+                success = env.place_with_rotation(part_id, rotations_rad[rot_id])
             else:
                 success = env.place_anywhere(part_id)
 
@@ -513,32 +551,26 @@ def _log_training_step(
     stats: dict,
     episode_time: float,
     rot_entropy: torch.Tensor | None = None,
+    value_loss: torch.Tensor | None = None,
+    val_expl_var: float = 0.0,
+    val_mean_target: float = 0.0,
 ) -> None:
-    n_placed  = env.n_placed()
-    n_rollout = stats["n_rollout_placed_init"]
-    greedy_d  = stats["rollout_density_init"]
-    vs_greedy = reward / greedy_d if greedy_d > 0 else float("nan")
+    n_placed = env.n_placed()
 
-    # Running mean of vs_greedy (EMA with α=0.05)
-    prev_mean = getattr(_log_training_step, "_vs_greedy_ema", vs_greedy)
-    ema = prev_mean + 0.05 * (vs_greedy - prev_mean) if not (vs_greedy != vs_greedy) else prev_mean
-    _log_training_step._vs_greedy_ema = ema
-
-    # Fraction of last 50 episodes that beat greedy
-    history = _log_training_step._vs_greedy_history
-    history.append(vs_greedy)
-    if len(history) > 50:
-        history.pop(0)
-    frac_above = sum(1 for v in history if v > 1.0) / len(history)
+    # Density EMA (α=0.02 ≈ ~50-episode window)
+    prev_ema = _log_training_step._density_ema
+    density_ema = prev_ema + 0.02 * (reward - prev_ema)
+    _log_training_step._density_ema = density_ema
 
     end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
     print(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
-        f"agent={n_placed}/{n_parts_ep}  greedy={n_rollout}/{n_parts_ep}  "
-        f"density={reward:.4f}  greedy={greedy_d:.4f}  vs_greedy={vs_greedy:+.3f}"
-        f"  loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}"
-        f"  imit={imitation_loss.item():.4f}({imitation_coef:.2f})"
-        f"  t={episode_time:.1f}s",
+        f"agent={n_placed}/{n_parts_ep}  "
+        f"d={reward:.4f}(ema={density_ema:.4f})  "
+        f"ev={val_expl_var:+.3f}  "
+        f"loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}  "
+        f"imit={imitation_loss.item():.4f}({imitation_coef:.2f})  "
+        f"t={episode_time:.1f}s",
         end=end_char, flush=True,
     )
 
@@ -551,17 +583,24 @@ def _log_training_step(
     _log_training_step._prev_hits   = hits
 
     log_dict = {
+        # Agent nesting quality
         "agent/density":            reward,
+        "agent/density_ema":        density_ema,
         "agent/parts_placed":       n_placed / n_parts_ep,
-        "agent/vs_greedy":          vs_greedy,
-        "agent/vs_greedy_ema":      ema,
-        "agent/frac_above_greedy":  frac_above,
-        "greedy/density":           greedy_d,
-        "greedy/parts_placed":      n_rollout / n_parts_ep,
+        # Value network health
+        "value/explained_variance": val_expl_var,
+        "value/mean_pred":          stats["value_mean"],
+        "value/mean_target":        val_mean_target,
+        "loss/value":               value_loss.item() if value_loss is not None else 0.0,
+        # Policy losses
         "loss/total":               loss.item(),
         "loss/entropy":             entropy_bonus.item(),
         "loss/imitation":           imitation_loss.item(),
         "loss/imitation_coef":      imitation_coef,
+        # Advantage signal
+        "train/advantage_mean":     stats["advantage_mean"],
+        "train/advantage_pos_frac": stats["advantage_pos_frac"],
+        # Performance
         "perf/episode_time_s":      episode_time,
         "cache/hit_rate":           ep_hit_rate,
         "cache/misses_per_episode": ep_misses,
@@ -571,10 +610,9 @@ def _log_training_step(
         log_dict["loss/rot_entropy"] = rot_entropy.item()
     wandb.log(log_dict, step=episode + 1)
 
-_log_training_step._prev_misses    = 0
-_log_training_step._prev_hits      = 0
-_log_training_step._vs_greedy_ema  = 1.0
-_log_training_step._vs_greedy_history: list[float] = []
+_log_training_step._prev_misses  = 0
+_log_training_step._prev_hits    = 0
+_log_training_step._density_ema  = 0.0
 
 
 def _log_eval_set(
@@ -724,6 +762,32 @@ def train(args: argparse.Namespace) -> None:
         f"n_eval_configs={args.n_eval_configs}  n_eval_parts={n_eval_parts}\n"
         f"  Checkpoint : {args.out_best}\n"
         f"─────────────────────────────────────────────────────────────────────\n"
+        f"\n── Metric guide ─────────────────────────────────────────────────────\n"
+        f"  d=X(ema=Y)   Packing density this episode (0–1) and its smoothed trend.\n"
+        f"               ema rises → agent is learning to nest more densely.\n"
+        f"               Typical greedy baseline: ~0.35–0.45 for aligners.\n"
+        f"\n"
+        f"  ev=X         Value explained variance (−∞ to 1).\n"
+        f"               How well the value network predicts future returns:\n"
+        f"                 > 0.5  good — value net is genuinely helping PPO\n"
+        f"                 ~ 0    bad  — predicting the mean, no useful signal\n"
+        f"                 < 0    broken — worse than a constant, check lr/arch\n"
+        f"               Expect low/negative early; should rise within ~500 eps.\n"
+        f"\n"
+        f"  loss=X       Total PPO loss (policy + value + entropy + imitation).\n"
+        f"               Should decrease early then plateau — large spikes = instability.\n"
+        f"\n"
+        f"  ent=X        Policy entropy (normalised 0–1). Measures exploration.\n"
+        f"               Too low (< 0.1) → agent collapsed to one action.\n"
+        f"               Too high (> 0.9) → agent still acting randomly.\n"
+        f"\n"
+        f"  imit=X(Y)    Imitation loss vs greedy-largest-first (weight Y, decays to 0).\n"
+        f"               Guides early exploration; ignore once weight reaches 0.\n"
+        f"\n"
+        f"  [eval]       Runs every {args.eval_interval} eps on fixed configs.\n"
+        f"               pure=X(R)  agent density and ratio vs greedy baseline.\n"
+        f"               R > 1.0 → agent beats greedy — the goal.\n"
+        f"─────────────────────────────────────────────────────────────────────\n"
     )
 
 
@@ -742,25 +806,31 @@ def train(args: argparse.Namespace) -> None:
         n_parts_ep = _curriculum_n_parts(episode, args)
         lib_ids    = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
         model.train()
-        log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
-            env, model, lib_ids, device, gamma=args.gamma,
-            value_interval=args.value_interval, rotations_rad=rotations_rad,
-        )
+        with torch.no_grad():
+            # Rollout: no graph needed — log_probs are detached, values are detached
+            log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
+                env, model, lib_ids, device, gamma=args.gamma,
+                gae_lambda=args.gae_lambda, rotations_rad=rotations_rad,
+            )
 
         entropy_coef   = _current_entropy_coef(episode, args)
         imitation_coef = _current_imitation_coef(episode, args)
 
         if log_probs:
-            old_log_probs = [lp.detach() for lp in log_probs]
+            old_log_probs  = [lp.detach() for lp in log_probs]
+            value_targets  = [obs[5].item() for obs in observations]
             for _ in range(args.ppo_epochs):
-                new_log_probs, new_entropies, new_rot_entropies, new_imitation = _evaluate_actions(
+                new_log_probs, new_entropies, new_rot_entropies, new_imitation, new_value_preds = _evaluate_actions(
                     model, observations, device)
-                loss, entropy_bonus, imitation_loss, rot_entropy = _ppo_loss(
+                loss, entropy_bonus, imitation_loss, rot_entropy, value_loss = _ppo_loss(
                     old_log_probs, new_log_probs, new_entropies, new_imitation,
                     advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
                     rot_entropies=new_rot_entropies,
                     rot_entropy_coef=rot_entropy_coef,
                     n_rotations=args.n_rotations,
+                    value_preds=new_value_preds,
+                    value_targets=value_targets,
+                    value_coef=args.value_coef,
                 )
                 if torch.isfinite(loss):
                     optimizer.zero_grad(set_to_none=True)
@@ -771,12 +841,26 @@ def train(args: argparse.Namespace) -> None:
                     loss = torch.tensor(0.0)
                     break
         else:
-            loss = entropy_bonus = imitation_loss = rot_entropy = torch.tensor(0.0)
+            loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
+            new_value_preds = []
+            value_targets   = []
+
+        # Value explained variance: 1 - Var(target - pred) / Var(target)
+        # > 0.5 → value net is useful; ~0 → predicting mean; < 0 → broken
+        val_expl_var    = 0.0
+        val_mean_target = 0.0
+        if value_targets:
+            vt_arr = np.array(value_targets, dtype=np.float32)
+            vp_arr = np.array([v.item() for v in new_value_preds], dtype=np.float32)
+            var_t  = float(np.var(vt_arr))
+            val_expl_var    = float(1.0 - np.var(vt_arr - vp_arr) / var_t) if var_t > 1e-8 else 0.0
+            val_mean_target = float(np.mean(vt_arr))
 
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
                            imitation_loss, imitation_coef, stats, episode_time,
-                           rot_entropy=rot_entropy)
+                           rot_entropy=rot_entropy, value_loss=value_loss,
+                           val_expl_var=val_expl_var, val_mean_target=val_mean_target)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(
@@ -828,8 +912,10 @@ def _parse() -> argparse.Namespace:
                    help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
     p.add_argument("--imitation-episodes",   type=int,   default=None,
                    help="Episodes over which imitation coef decays to 0 (default: curriculum_episodes).")
-    p.add_argument("--value-interval",       type=int,   default=3,
-                   help="Call rollout_value() every N steps; reuse last value in between (default 3).")
+    p.add_argument("--gae-lambda",           type=float, default=0.95,
+                   help="GAE lambda for advantage estimation (default 0.95).")
+    p.add_argument("--value-coef",           type=float, default=0.5,
+                   help="Value loss coefficient in PPO loss (default 0.5).")
     p.add_argument("--rotations",           type=float, nargs="+", default=None,
                    metavar="DEG",
                    help="Allowed rotation angles in degrees for all parts "

@@ -21,7 +21,7 @@ Episode loop (SplitPointerNet with rotation)
     for step in range(n_parts):
         obs    = torch.from_numpy(env.preview_images_per_rotation(rotations_rad))
         mask   = build_remaining_mask(env.remaining_item_ids(), N)
-        part_logits, rot_feats, ctx = model(obs, mask)        # (N,), (N,R,128), (N,128)
+        part_logits, rot_feats, ctx, value = model(obs, mask)  # (N,), (N,R,128), (N,128), ()
         part_id  = Categorical(logits=part_logits).sample()
         rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])  # (R,)
         rot_id   = Categorical(logits=rot_logits).sample()
@@ -164,6 +164,7 @@ class SplitPointerNet(nn.Module):
         self.part_ctx      = PartTransformer()
         self.part_head     = nn.Linear(128, 1)
         self.rotation_head = RotationHead()
+        self.value_head    = nn.Linear(128, 1)
 
     def rotation_feats_for_part(self, obs_part: torch.Tensor) -> torch.Tensor:
         """
@@ -186,7 +187,7 @@ class SplitPointerNet(nn.Module):
         self,
         obs:  torch.Tensor,  # (N, R+1, 128, 128)
         mask: torch.Tensor,  # (N,) 1=available, 0=placed
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Score all candidate parts jointly and return per-rotation embeddings.
 
@@ -194,6 +195,7 @@ class SplitPointerNet(nn.Module):
             part_logits : (N,)        placed parts set to −1e9
             rot_feats   : (N, R, 128) per-(part, rotation) CNN embeddings
             ctx         : (N, 128)    context-enriched part embeddings
+            value       : ()          scalar state value estimate V(s)
         """
         N, Rp1, H, W = obs.shape
         R = Rp1 - 1
@@ -216,7 +218,13 @@ class SplitPointerNet(nn.Module):
 
         ctx    = self.part_ctx(fused, mask)                            # (N, 128)
         logits = self.part_head(ctx).squeeze(-1)                       # (N,)
-        return logits.masked_fill(mask == 0, -1e9), rot_feats, ctx
+
+        remaining_ctx = ctx[mask > 0.5]
+        if remaining_ctx.shape[0] == 0:
+            remaining_ctx = ctx
+        value = self.value_head(remaining_ctx.mean(0)).squeeze()       # scalar
+
+        return logits.masked_fill(mask == 0, -1e9), rot_feats, ctx, value
 
 
 # ---------------------------------------------------------------------------
@@ -324,16 +332,18 @@ if __name__ == "__main__":
     mask  = torch.ones(N_PARTS)
     mask[2] = 0.0
 
-    part_logits, rot_feats, ctx = model(obs, mask)
+    part_logits, rot_feats, ctx, value = model(obs, mask)
     assert part_logits.shape == (N_PARTS,),              f"part_logits: {tuple(part_logits.shape)}"
     assert rot_feats.shape   == (N_PARTS, N_ROTATIONS, 128), f"rot_feats: {tuple(rot_feats.shape)}"
     assert ctx.shape         == (N_PARTS, 128),          f"ctx: {tuple(ctx.shape)}"
     assert part_logits[2].item() == -1e9,                "masked part should be -1e9"
+    assert value.shape       == (),                      f"value: {tuple(value.shape)}"
 
     rot_logits = model.rotation_head(ctx[0], rot_feats[0])
     assert rot_logits.shape == (N_ROTATIONS,),           f"rot_logits: {tuple(rot_logits.shape)}"
     print(f"SplitPointerNet shape check OK — part_logits: {tuple(part_logits.shape)}, "
-          f"rot_feats: {tuple(rot_feats.shape)}, rot_logits: {tuple(rot_logits.shape)}")
+          f"rot_feats: {tuple(rot_feats.shape)}, rot_logits: {tuple(rot_logits.shape)}, "
+          f"value: scalar")
 
     # SpatialPointerNet — unchanged interface (returns (N,) logits directly)
     spatial = SpatialPointerNet().eval()
