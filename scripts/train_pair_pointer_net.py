@@ -797,19 +797,21 @@ def train(args: argparse.Namespace) -> None:
         config_rollout_idx += 1
 
         if config_rollout_idx == args.rollouts_per_config:
-            # Per-config baseline: advantage = best_density - mean_density across K rollouts.
-            # Every step in the best episode gets the same scalar — no per-step credit
-            # assignment, just "this ordering beat the average by this much."
+            # Use best and worst rollouts of this config.
+            # Best gets positive advantage, worst gets negative — providing contrast.
+            # Advantage = episode_density - mean_density (same scalar for all steps).
             mean_density = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
-            best = max(cfg_rollouts, key=lambda x: x[0])
-            _, b_lp, b_ent, b_rot, _, b_obs = best
-            per_config_adv = best[0] - mean_density
-            b_adv = [per_config_adv] * len(b_lp)
-            batch_log_probs.extend(b_lp)
-            batch_entropies.extend(b_ent)
-            batch_rot_ents.extend(b_rot)
-            batch_advantages.extend(b_adv)
-            batch_observations.extend(b_obs)
+            best  = max(cfg_rollouts, key=lambda x: x[0])
+            worst = min(cfg_rollouts, key=lambda x: x[0])
+            for rollout in [best, worst]:
+                density, r_lp, r_ent, r_rot, _, r_obs = rollout
+                adv = density - mean_density  # best: positive, worst: negative
+                r_adv = [adv] * len(r_lp)
+                batch_log_probs.extend(r_lp)
+                batch_entropies.extend(r_ent)
+                batch_rot_ents.extend(r_rot)
+                batch_advantages.extend(r_adv)
+                batch_observations.extend(r_obs)
             cfg_rollouts.clear()
             config_rollout_idx = 0
 
