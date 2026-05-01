@@ -809,12 +809,10 @@ def train(args: argparse.Namespace) -> None:
             cfg_rollouts.clear()
             config_rollout_idx = 0
 
-        entropy_coef   = _current_entropy_coef(episode, args)
-        imitation_coef = _current_imitation_coef(episode, args)
+            # PPO update on every config flush
+            entropy_coef   = _current_entropy_coef(episode, args)
+            imitation_coef = _current_imitation_coef(episode, args)
 
-        # PPO update every episodes_per_update episodes
-        do_update = (episode + 1) % args.episodes_per_update == 0
-        if do_update and batch_log_probs:
             old_log_probs = [lp.detach() for lp in batch_log_probs]
             N_total = len(batch_observations)
 
@@ -877,17 +875,15 @@ def train(args: argparse.Namespace) -> None:
                 imitation_loss = torch.tensor(epoch_imit)
                 rot_entropy    = torch.tensor(epoch_rot_ent)
 
-            # Clear accumulators; also reset config-group tracking so the next
-            # episode starts a fresh group (policy has changed after the update).
             batch_log_probs.clear()
             batch_entropies.clear()
             batch_rot_ents.clear()
             batch_advantages.clear()
             batch_observations.clear()
-            cfg_rollouts.clear()
-            config_rollout_idx = 0
-            current_lib_ids    = None
+            current_lib_ids = None
         else:
+            entropy_coef   = _current_entropy_coef(episode, args)
+            imitation_coef = _current_imitation_coef(episode, args)
             loss = entropy_bonus = imitation_loss = rot_entropy = torch.tensor(0.0)
 
         episode_time = time.perf_counter() - t0
@@ -942,15 +938,13 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",             type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
-    p.add_argument("--episodes-per-update", type=int,   default=4,
-                   help="Accumulate this many episodes before each PPO update (default 4).")
     p.add_argument("--rollouts-per-config", type=int,   default=1,
                    help="Run this many rollouts on the same parts config before sampling a new one (default 1). "
                         "Within-group advantage normalization removes config-difficulty variance, "
                         "leaving only policy-quality signal.")
     p.add_argument("--ppo-mini-batch",      type=int,   default=0,
                    help="Mini-batch size within each PPO epoch (0 = full batch, default 0). "
-                        "Set e.g. 16 on GPU to avoid OOM when episodes-per-update is large.")
+                        "Set e.g. 16 on GPU to avoid OOM on large configs.")
     p.add_argument("--imitation-coef",        type=float, default=0.3,
                    help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
     p.add_argument("--imitation-episodes",   type=int,   default=500,
