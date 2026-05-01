@@ -168,14 +168,6 @@ def _run_episode(
     env.reset(lib_ids)
     n_parts = len(lib_ids)
 
-    # Comparative baseline: run greedy on this config, then reset for agent episode.
-    # Per-step rewards are offset by greedy_density/n_parts so total return =
-    # agent_density - greedy_density (positive = beats greedy, negative = worse).
-    env.place_remaining()
-    greedy_density_baseline = env.packing_density()
-    greedy_reward_offset    = greedy_density_baseline / n_parts
-    env.reset(lib_ids)
-
     log_probs:      list[torch.Tensor] = []
     entropies:      list[torch.Tensor] = []
     rot_entropies:  list[torch.Tensor] = []
@@ -229,7 +221,7 @@ def _run_episode(
                 torch.tensor(gt),
             ))
 
-        R_t = env.packing_density() - prev_density - greedy_reward_offset
+        R_t = env.packing_density() - prev_density
         prev_density = env.packing_density()
         R_t_list.append(R_t)
 
@@ -262,7 +254,6 @@ def _run_episode(
     vp_list = [v.item() for v in value_preds_ep]
     stats = {
         "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list else 0.0,
-        "greedy_baseline":    greedy_density_baseline,
         "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list else 0.0,
         "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list else 0.0,
         "value_mean":         float(np.mean(vp_list))   if vp_list else 0.0,
@@ -592,7 +583,6 @@ def _log_training_step(
         # Agent nesting quality
         "agent/density":            reward,
         "agent/density_ema":        density_ema,
-        "agent/vs_greedy":          reward - stats["greedy_baseline"],
         "agent/parts_placed":       n_placed / n_parts_ep,
         # Value network health
         "value/explained_variance": val_expl_var,
