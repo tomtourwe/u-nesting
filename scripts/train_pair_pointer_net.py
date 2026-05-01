@@ -557,9 +557,9 @@ def _log_training_step(
 ) -> None:
     n_placed = env.n_placed()
 
-    # Density EMA (α=0.02 ≈ ~50-episode window)
+    # Density EMA (α=0.02 ≈ ~50-episode window); warm-start on first episode
     prev_ema = _log_training_step._density_ema
-    density_ema = prev_ema + 0.02 * (reward - prev_ema)
+    density_ema = reward if prev_ema == 0.0 else prev_ema + 0.02 * (reward - prev_ema)
     _log_training_step._density_ema = density_ema
 
     end_char = "\n" if (episode + 1) % args.log_interval == 0 else "\r"
