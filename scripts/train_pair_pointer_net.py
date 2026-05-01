@@ -24,10 +24,9 @@ Episode loop
        b. part_logits = model(pair_images, mask)
        c. Sample part_id ~ Categorical(part_logits).
        d. Ask U-Nesting to place the part.
-  3. Per-step reward: R_t = packing_density(s_{t+1}) − packing_density(s_t)
-     Value baseline: V(s) = neural value head on SplitPointerNet, trained on actual returns
-     Advantage: GAE(λ=0.95) using actual rewards and bootstrapped values
-  4. Loss = PPO_loss − entropy_coef·entropy + value_coef·MSE(V_pred, V_target)
+  3. Best-of-K selection: run K rollouts per config, keep the best (highest density).
+     Advantage: best_density − mean_density across K rollouts (same scalar for all steps).
+  4. Loss = PPO_loss − entropy_coef·entropy + imitation_coef·imitation_loss
 
 Usage:
     maturin develop --release --features python-bindings
@@ -168,13 +167,12 @@ def _run_episode(
     env.reset(lib_ids)
     n_parts = len(lib_ids)
 
-    log_probs:      list[torch.Tensor] = []
-    entropies:      list[torch.Tensor] = []
-    rot_entropies:  list[torch.Tensor] = []
-    observations:   list[tuple]        = []
-    snapshots:      list               = []
-    R_t_list:       list[float]        = []
-    value_preds_ep: list[torch.Tensor] = []
+    log_probs:     list[torch.Tensor] = []
+    entropies:     list[torch.Tensor] = []
+    rot_entropies: list[torch.Tensor] = []
+    observations:  list[tuple]        = []
+    snapshots:     list               = []
+    R_t_list:      list[float]        = []
 
     prev_density = env.packing_density()
     skip_ids: set[int] = set()
@@ -192,7 +190,7 @@ def _run_episode(
             obs_np = env.preview_pair_images()
         obs_t = torch.from_numpy(obs_np).to(device, non_blocking=True)
 
-        part_id, part_dist, _, rot_id, rot_dist, value = _sample_action(model, obs_t, mask, greedy)
+        part_id, part_dist, _, rot_id, rot_dist, _ = _sample_action(model, obs_t, mask, greedy)
 
         if rotations_rad is not None and rot_id is not None:
             success = env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
@@ -202,10 +200,6 @@ def _run_episode(
         if not success:
             skip_ids.add(part_id.item())
             continue
-
-        value_preds_ep.append(
-            value.detach() if value is not None else torch.tensor(0.0, device=device)
-        )
 
         if not greedy:
             lp, ent, rot_ent = _action_log_prob_and_entropy(
@@ -231,29 +225,17 @@ def _run_episode(
     # Every step gets the full episode return (final density) as its advantage.
     # The per-config baseline is subtracted later in the training loop, after
     # all K rollouts of the same config have been collected.
-    final_density    = env.packing_density()
-    T                = len(R_t_list)
-    value_targets_ep = [final_density] * T
-    A_t_list         = [final_density] * T
-
-    # Attach value targets to stored observations
-    if not greedy and observations:
-        observations = [
-            (*obs, torch.tensor(vt, dtype=torch.float32))
-            for obs, vt in zip(observations, value_targets_ep)
-        ]
+    final_density = env.packing_density()
+    T             = len(R_t_list)
+    A_t_list      = [final_density] * T
 
     episode_reward = final_density
     board_area     = env.plate_w * env.plate_h
 
-    vp_list = [v.item() for v in value_preds_ep]
     stats = {
         "R_t_mean":           float(np.mean(R_t_list))                  if R_t_list else 0.0,
         "advantage_mean":     float(np.mean(A_t_list))                  if A_t_list else 0.0,
         "advantage_pos_frac": float(np.mean([a > 0 for a in A_t_list])) if A_t_list else 0.0,
-        "value_mean":         float(np.mean(vp_list))   if vp_list else 0.0,
-        "value_std":          float(np.std(vp_list))    if vp_list else 0.0,
-        "value_step_decay":   float(vp_list[0] - vp_list[-1]) if len(vp_list) >= 2 else 0.0,
         "bbox_frac":          env.bbox_area() / board_area,
     }
 
@@ -309,22 +291,18 @@ def _evaluate_actions(
     model: torch.nn.Module,
     observations: list[tuple],
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, part_entropies, rot_entropies, imitation_losses, value_preds = [], [], [], [], []
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    log_probs, part_entropies, rot_entropies, imitation_losses = [], [], [], []
     for obs_entry in observations:
-        obs_t, mask, part_id, rot_id, greedy_target, _value_target = obs_entry
+        obs_t, mask, part_id, rot_id, greedy_target = obs_entry
         obs_t   = obs_t.to(device,   non_blocking=True)
         mask    = mask.to(device,    non_blocking=True)
         part_id = part_id.to(device, non_blocking=True)
 
         with _autocast(device):
             output = model(obs_t, mask)
-            value = None
             if isinstance(output, tuple):
-                if len(output) == 4:
-                    part_logits, rot_feats, ctx, value = output
-                else:
-                    part_logits, rot_feats, ctx = output
+                part_logits, rot_feats, ctx = output[0], output[1], output[2]
             else:
                 part_logits, rot_feats, ctx = output, None, None
 
@@ -333,7 +311,7 @@ def _evaluate_actions(
                 rot_dist   = Categorical(logits=rot_logits)
                 rot_entropies.append(rot_dist.entropy())
             else:
-                rot_logits = rot_dist = None
+                rot_dist = None
 
         part_dist = Categorical(logits=part_logits)
         lp        = part_dist.log_prob(part_id)
@@ -346,8 +324,7 @@ def _evaluate_actions(
         imitation_losses.append(
             F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device, non_blocking=True))
         )
-        value_preds.append(value if value is not None else torch.tensor(0.0, device=device))
-    return log_probs, part_entropies, rot_entropies, imitation_losses, value_preds
+    return log_probs, part_entropies, rot_entropies, imitation_losses
 
 
 def _ppo_loss(
@@ -364,10 +341,7 @@ def _ppo_loss(
     rot_entropies: list[torch.Tensor] | None = None,
     rot_entropy_coef: float = 0.0,
     n_rotations: int = 8,
-    value_preds: list[torch.Tensor] | None = None,
-    value_targets: list[float] | None = None,
-    value_coef: float = 0.5,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     adv     = torch.tensor(advantages, dtype=torch.float32, device=device)
     old_lp  = torch.stack(old_log_probs).detach()
     new_lp  = torch.stack(new_log_probs)
@@ -381,13 +355,7 @@ def _ppo_loss(
     if rot_entropies:
         rot_entropy = torch.stack(rot_entropies).mean() / math.log(max(n_rotations, 2))
         total = total - rot_entropy_coef * rot_entropy
-    value_loss = torch.tensor(0.0, device=device)
-    if value_preds and value_targets:
-        vp = torch.stack(value_preds)
-        vt = torch.tensor(value_targets, dtype=torch.float32, device=device)
-        value_loss = F.mse_loss(vp, vt)
-        total = total + value_coef * value_loss
-    return total, part_entropy, imitation_loss, rot_entropy, value_loss
+    return total, part_entropy, imitation_loss, rot_entropy
 
 
 def _run_greedy_eval(
@@ -543,9 +511,6 @@ def _log_training_step(
     stats: dict,
     episode_time: float,
     rot_entropy: torch.Tensor | None = None,
-    value_loss: torch.Tensor | None = None,
-    val_expl_var: float = 0.0,
-    val_mean_target: float = 0.0,
 ) -> None:
     n_placed = env.n_placed()
 
@@ -559,7 +524,6 @@ def _log_training_step(
         f"[train] ep={episode+1:>5}/{args.episodes}  "
         f"agent={n_placed}/{n_parts_ep}  "
         f"d={reward:.4f}(ema={density_ema:.4f})  "
-        f"ev={val_expl_var:+.3f}  "
         f"loss={loss.item():.4f}  ent={entropy_bonus.item():.4f}  "
         f"imit={imitation_loss.item():.4f}({imitation_coef:.2f})  "
         f"t={episode_time:.1f}s",
@@ -579,13 +543,6 @@ def _log_training_step(
         "agent/density":            reward,
         "agent/density_ema":        density_ema,
         "agent/parts_placed":       n_placed / n_parts_ep,
-        # Value network health
-        "value/explained_variance": val_expl_var,
-        "value/mean_pred":          stats["value_mean"],
-        "value/mean_target":        val_mean_target,
-        "value/pred_std":           stats["value_std"],
-        "value/step_decay":         stats["value_step_decay"],
-        "loss/value":               value_loss.item() if value_loss is not None else 0.0,
         # Policy losses
         "loss/total":               loss.item(),
         "loss/entropy":             entropy_bonus.item(),
@@ -774,16 +731,7 @@ def train(args: argparse.Namespace) -> None:
         f"               ema rises → agent is learning to nest more densely.\n"
         f"               Typical greedy baseline: ~0.35–0.45 for aligners.\n"
         f"\n"
-        f"  ev=X         Value explained variance (−∞ to 1). Weak signal here because\n"
-        f"               density targets have naturally low variance (narrow range).\n"
-        f"               Watch value/pred_std and value/step_decay in wandb instead:\n"
-        f"                 pred_std  → std of V(s) across steps in an episode.\n"
-        f"                             Near 0 = predicting same value for every state (bad).\n"
-        f"                             Growing = learning state-dependent structure (good).\n"
-        f"                 step_decay → V(s_first) − V(s_last). Should be ≈ total episode\n"
-        f"                             return (~0.4). Near 0 = not learning step progression.\n"
-        f"\n"
-        f"  loss=X       Total PPO loss (policy + value + entropy + imitation).\n"
+        f"  loss=X       Total PPO loss (policy + entropy + imitation).\n"
         f"               Should decrease early then plateau — large spikes = instability.\n"
         f"\n"
         f"  ent=X        Policy entropy (normalised 0–1). Measures exploration.\n"
@@ -872,7 +820,6 @@ def train(args: argparse.Namespace) -> None:
         do_update = (episode + 1) % args.episodes_per_update == 0
         if do_update and batch_log_probs:
             old_log_probs = [lp.detach() for lp in batch_log_probs]
-            value_targets = [obs[5].item() for obs in batch_observations]
             N_total = len(batch_observations)
 
             # Normalize advantages over the full batch before splitting into mini-batches
@@ -883,34 +830,27 @@ def train(args: argparse.Namespace) -> None:
                 if adv_std > 1e-8 else batch_advantages
             )
 
-            mini_bs = args.ppo_mini_batch if args.ppo_mini_batch > 0 else N_total
-            new_value_preds: list = []
+            mini_bs   = args.ppo_mini_batch if args.ppo_mini_batch > 0 else N_total
             nan_break = False
 
             for _ in range(args.ppo_epochs):
                 optimizer.zero_grad(set_to_none=True)
-                epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = epoch_val = 0.0
-                all_vp: list = []
+                epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = 0.0
 
                 for start in range(0, N_total, mini_bs):
                     chunk_obs = batch_observations[start : start + mini_bs]
                     chunk_old = old_log_probs[start : start + mini_bs]
                     chunk_adv = norm_adv[start : start + mini_bs]
-                    chunk_vt  = [obs[5].item() for obs in chunk_obs]
 
-                    new_lp, new_ent, new_rot_ent, new_imit, new_vp = _evaluate_actions(
+                    new_lp, new_ent, new_rot_ent, new_imit = _evaluate_actions(
                         model, chunk_obs, device)
-                    all_vp.extend(new_vp)
 
-                    chunk_loss, ent_b, imit_l, rot_e, val_l = _ppo_loss(
+                    chunk_loss, ent_b, imit_l, rot_e = _ppo_loss(
                         chunk_old, new_lp, new_ent, new_imit, chunk_adv,
                         entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
                         rot_entropies=new_rot_ent,
                         rot_entropy_coef=rot_entropy_coef,
                         n_rotations=args.n_rotations,
-                        value_preds=new_vp,
-                        value_targets=chunk_vt,
-                        value_coef=args.value_coef,
                     )
 
                     if not torch.isfinite(chunk_loss):
@@ -924,7 +864,6 @@ def train(args: argparse.Namespace) -> None:
                     epoch_ent     += ent_b.item() * scale
                     epoch_imit    += imit_l.item() * scale
                     epoch_rot_ent += rot_e.item() * scale
-                    epoch_val     += val_l.item() * scale
 
                 if nan_break:
                     loss = torch.tensor(0.0)
@@ -937,8 +876,6 @@ def train(args: argparse.Namespace) -> None:
                 entropy_bonus  = torch.tensor(epoch_ent)
                 imitation_loss = torch.tensor(epoch_imit)
                 rot_entropy    = torch.tensor(epoch_rot_ent)
-                value_loss     = torch.tensor(epoch_val)
-                new_value_preds = all_vp  # last epoch's preds used for EV logging
 
             # Clear accumulators; also reset config-group tracking so the next
             # episode starts a fresh group (policy has changed after the update).
@@ -951,25 +888,12 @@ def train(args: argparse.Namespace) -> None:
             config_rollout_idx = 0
             current_lib_ids    = None
         else:
-            loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
-            new_value_preds = []
-            value_targets   = []
-
-        # Value explained variance
-        val_expl_var    = 0.0
-        val_mean_target = 0.0
-        if value_targets:
-            vt_arr = np.array(value_targets, dtype=np.float32)
-            vp_arr = np.array([v.item() for v in new_value_preds], dtype=np.float32)
-            var_t  = float(np.var(vt_arr))
-            val_expl_var    = float(1.0 - np.var(vt_arr - vp_arr) / var_t) if var_t > 1e-8 else 0.0
-            val_mean_target = float(np.mean(vt_arr))
+            loss = entropy_bonus = imitation_loss = rot_entropy = torch.tensor(0.0)
 
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
                            imitation_loss, imitation_coef, stats, episode_time,
-                           rot_entropy=rot_entropy, value_loss=value_loss,
-                           val_expl_var=val_expl_var, val_mean_target=val_mean_target)
+                           rot_entropy=rot_entropy)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(
@@ -1033,8 +957,6 @@ def _parse() -> argparse.Namespace:
                    help="Episodes over which imitation coef decays to 0.")
     p.add_argument("--gae-lambda",           type=float, default=0.95,
                    help="GAE lambda for advantage estimation (default 0.95).")
-    p.add_argument("--value-coef",           type=float, default=0.5,
-                   help="Value loss coefficient in PPO loss (default 0.5).")
     p.add_argument("--rotations",           type=float, nargs="+", default=None,
                    metavar="DEG",
                    help="Allowed rotation angles in degrees for all parts "
