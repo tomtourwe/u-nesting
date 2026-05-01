@@ -468,6 +468,8 @@ def _run_greedy_eval(
     n_fallback    = env.place_remaining()
     fallback_density  = env.packing_density()
     n_placed_fallback = n_placed_pure + n_fallback
+    if n_fallback > 0:
+        snapshots.append((env.placed_polygons(), fallback_density))
 
     remaining      = env.remaining_item_ids()
     unplaced_polys = []
@@ -632,11 +634,11 @@ def _log_eval_set(
     plot_snapshots = plot_greedy_polys = plot_lib_ids = plot_unplaced_polys = None
     plot_n_placed = plot_n_greedy = 0
     plot_greedy_density = 0.0
-    best_ratio = -float("inf")
+    best_density_seen  = -float("inf")
+    worst_density_seen =  float("inf")
     worst_snapshots = worst_greedy_polys = worst_lib_ids = worst_unplaced_polys = None
     worst_n_placed = worst_n_greedy = 0
     worst_greedy_density = 0.0
-    worst_ratio = float("inf")
 
     for lib_ids in eval_configs:
         pure_density, fb_density, snapshots, n_placed, n_placed_fb, unplaced_polys = _run_greedy_eval(
@@ -659,8 +661,8 @@ def _log_eval_set(
         n_placed_fb_list.append(n_placed_fb)
         n_greedy_list.append(n_greedy)
 
-        if not np.isnan(ratio_pure) and ratio_pure > best_ratio:
-            best_ratio           = ratio_pure
+        if pure_density > best_density_seen:
+            best_density_seen    = pure_density
             plot_snapshots       = snapshots
             plot_greedy_polys    = greedy_polys
             plot_lib_ids         = lib_ids
@@ -669,8 +671,8 @@ def _log_eval_set(
             plot_greedy_density  = greedy_density
             plot_unplaced_polys  = unplaced_polys
 
-        if not np.isnan(ratio_pure) and ratio_pure < worst_ratio:
-            worst_ratio           = ratio_pure
+        if pure_density < worst_density_seen:
+            worst_density_seen    = pure_density
             worst_snapshots       = snapshots
             worst_greedy_polys    = greedy_polys
             worst_lib_ids         = lib_ids
