@@ -632,7 +632,7 @@ def _log_eval_set(
     plot_snapshots = plot_greedy_polys = plot_lib_ids = plot_unplaced_polys = None
     plot_n_placed = plot_n_greedy = 0
     plot_greedy_density = 0.0
-    best_n_greedy = -1
+    best_ratio = -float("inf")
     worst_snapshots = worst_greedy_polys = worst_lib_ids = worst_unplaced_polys = None
     worst_n_placed = worst_n_greedy = 0
     worst_greedy_density = 0.0
@@ -659,8 +659,8 @@ def _log_eval_set(
         n_placed_fb_list.append(n_placed_fb)
         n_greedy_list.append(n_greedy)
 
-        if n_greedy > best_n_greedy:
-            best_n_greedy        = n_greedy
+        if not np.isnan(ratio_pure) and ratio_pure > best_ratio:
+            best_ratio           = ratio_pure
             plot_snapshots       = snapshots
             plot_greedy_polys    = greedy_polys
             plot_lib_ids         = lib_ids
