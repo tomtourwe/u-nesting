@@ -691,8 +691,8 @@ def _log_eval_set(
     mean_fb            = float(np.mean(fb_densities))
     mean_greedy        = float(np.mean(greedy_densities))
 
-    print(f"  pure={mean_agent:.4f}({mean_ratio_pure:.3f})  "
-          f"fallback={mean_fb:.4f}({mean_ratio_fb:.3f})  "
+    print(f"  agent={mean_agent:.4f}({mean_ratio_pure:.3f}x)  "
+          f"+autofill={mean_fb:.4f}({mean_ratio_fb:.3f}x)  "
           f"greedy={mean_greedy:.4f}  "
           f"placed={mean_placed:.1f}/{mean_placed_fb:.1f} vs {mean_greedy_placed:.1f}")
 
@@ -785,8 +785,11 @@ def train(args: argparse.Namespace) -> None:
         f"               Guides early exploration; ignore once weight reaches 0.\n"
         f"\n"
         f"  [eval]       Runs every {args.eval_interval} eps on fixed configs.\n"
-        f"               pure=X(R)  agent density and ratio vs greedy baseline.\n"
-        f"               R > 1.0 → agent beats greedy — the goal.\n"
+        f"               agent=X(Rx)   density from agent placements only, ratio vs greedy.\n"
+        f"               +autofill=X   density after engine greedily fills remaining gaps.\n"
+        f"               greedy=X      pure greedy baseline (no agent) on same configs.\n"
+        f"               placed=A/B vs G  parts placed: agent / agent+autofill vs greedy.\n"
+        f"               Rx > 1.0 → agent beats greedy — the goal.\n"
         f"─────────────────────────────────────────────────────────────────────\n"
     )
 
