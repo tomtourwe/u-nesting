@@ -483,6 +483,7 @@ def _run_greedy_eval(
 def _make_eval_figure(
     eval_snapshots: list,
     eval_n_placed: int,
+    eval_n_placed_fb: int,
     eval_lib_ids: list[int],
     episode: int,
     args: argparse.Namespace,
@@ -491,11 +492,12 @@ def _make_eval_figure(
     greedy_density: float,
     unplaced_polys: list | None = None,
 ) -> plt.Figure:
+    final_density = eval_snapshots[-1][1] if eval_snapshots else 0.0
     all_panels = [
         (greedy_polys, greedy_density, f"Greedy  {greedy_n_placed}/{len(eval_lib_ids)}\nd={greedy_density:.3f}")
     ] + [
         (polys, density,
-         f"ep {episode+1}  agent {eval_n_placed}/{len(eval_lib_ids)}\n#{i+1}  d={density:.3f}"
+         f"ep {episode+1}  {eval_n_placed_fb}/{len(eval_lib_ids)}  d={final_density:.3f}\n#{i+1}  d={density:.3f}"
          if i == 0 else f"#{i+1}  d={density:.3f}")
         for i, (polys, density) in enumerate(eval_snapshots)
     ]
@@ -628,12 +630,12 @@ def _log_eval_set(
     agent_densities, fb_densities, greedy_densities = [], [], []
     n_placed_list, n_placed_fb_list, n_greedy_list  = [], [], []
     plot_snapshots = plot_greedy_polys = plot_lib_ids = plot_unplaced_polys = None
-    plot_n_placed = plot_n_greedy = 0
+    plot_n_placed = plot_n_placed_fb = plot_n_greedy = 0
     plot_greedy_density = 0.0
     best_density_seen  = -float("inf")
     worst_density_seen =  float("inf")
     worst_snapshots = worst_greedy_polys = worst_lib_ids = worst_unplaced_polys = None
-    worst_n_placed = worst_n_greedy = 0
+    worst_n_placed = worst_n_placed_fb = worst_n_greedy = 0
     worst_greedy_density = 0.0
 
     for lib_ids in eval_configs:
@@ -663,6 +665,7 @@ def _log_eval_set(
             plot_greedy_polys    = greedy_polys
             plot_lib_ids         = lib_ids
             plot_n_placed        = n_placed
+            plot_n_placed_fb     = n_placed_fb
             plot_n_greedy        = n_greedy
             plot_greedy_density  = greedy_density
             plot_unplaced_polys  = unplaced_polys
@@ -673,6 +676,7 @@ def _log_eval_set(
             worst_greedy_polys    = greedy_polys
             worst_lib_ids         = lib_ids
             worst_n_placed        = n_placed
+            worst_n_placed_fb     = n_placed_fb
             worst_n_greedy        = n_greedy
             worst_greedy_density  = greedy_density
             worst_unplaced_polys  = unplaced_polys
@@ -694,11 +698,11 @@ def _log_eval_set(
           f"placed={mean_placed:.1f}/{mean_placed_fb:.1f} vs {mean_greedy_placed:.1f}")
 
     fig_best = _make_eval_figure(
-        plot_snapshots, plot_n_placed, plot_lib_ids, episode, args,
+        plot_snapshots, plot_n_placed, plot_n_placed_fb, plot_lib_ids, episode, args,
         plot_greedy_polys, plot_n_greedy, plot_greedy_density, plot_unplaced_polys,
     )
     fig_worst = _make_eval_figure(
-        worst_snapshots, worst_n_placed, worst_lib_ids, episode, args,
+        worst_snapshots, worst_n_placed, worst_n_placed_fb, worst_lib_ids, episode, args,
         worst_greedy_polys, worst_n_greedy, worst_greedy_density, worst_unplaced_polys,
     )
     wandb.log({
