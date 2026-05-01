@@ -407,10 +407,8 @@ def _run_greedy_eval(
     """
     Run the agent greedily (argmax) on eval_lib_ids.
 
-    Uses a two-phase observation strategy when rotations are enabled:
-      Phase 1 — preview_pair_images()      (N Rust calls) → part head → argmax part
-      Phase 2 — preview_images_for_part()  (R Rust calls) → rotation head → argmax rot
-    Total: N+R calls per step instead of N×R. No rollout_value() calls.
+    Uses the same observation as training (preview_images_per_rotation when rotations
+    are enabled) so the model sees identical inputs during eval and training.
 
     After the agent episode ends, place_remaining() fills whatever is left
     (engine picks rotation). This gives two metrics at no extra episode cost:
@@ -431,28 +429,24 @@ def _run_greedy_eval(
 
             mask = _build_remaining_mask(remaining, n_parts, device)
 
-            # Phase 1: part selection via cheap pair images (N Rust calls)
-            obs_pair = torch.from_numpy(env.preview_pair_images()).to(device, non_blocking=True)
-            with _autocast(device):
-                output = model(obs_pair, mask)
-            if isinstance(output, tuple):
-                part_logits, _, ctx = output[0], output[1], output[2]  # ignore value at [3]
-            else:
-                part_logits, ctx = output, None
-
-            part_id = int(part_logits.argmax().item())
-
-            # Phase 2: rotation selection for chosen part only (R Rust calls)
-            if rotations_rad is not None and ctx is not None and hasattr(model, "rotation_head"):
-                obs_part = torch.from_numpy(
-                    env.preview_images_for_part(part_id, rotations_rad)
+            if rotations_rad is not None:
+                # Same observation as training: (N, R+1, H, W) with all rotations
+                obs = torch.from_numpy(
+                    env.preview_images_per_rotation(rotations_rad)
                 ).to(device, non_blocking=True)
                 with _autocast(device):
-                    rot_feats  = model.rotation_feats_for_part(obs_part)   # (R, 128)
-                    rot_logits = model.rotation_head(ctx[part_id], rot_feats)
+                    part_logits, rot_feats, ctx, _ = model(obs, mask)
+                part_id    = int(part_logits.argmax().item())
+                with _autocast(device):
+                    rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
                 rot_id  = int(rot_logits.argmax().item())
                 success = env.place_with_rotation(part_id, rotations_rad[rot_id])
             else:
+                obs = torch.from_numpy(env.preview_pair_images()).to(device, non_blocking=True)
+                with _autocast(device):
+                    output = model(obs, mask)
+                part_logits = output[0] if isinstance(output, tuple) else output
+                part_id = int(part_logits.argmax().item())
                 success = env.place_anywhere(part_id)
 
             if not success:
@@ -784,8 +778,7 @@ def train(args: argparse.Namespace) -> None:
         f"  imit=X(Y)    Imitation loss vs greedy-largest-first (weight Y, decays to 0).\n"
         f"               Guides early exploration; ignore once weight reaches 0.\n"
         f"\n"
-        f"  [eval]       Runs every {args.eval_interval} eps on fixed configs.\n"
-        f"               agent=X(Rx)   density from agent placements only, ratio vs greedy.\n"
+        f"  [eval]       agent=X(Rx)   density from agent placements only, ratio vs greedy.\n"
         f"               +autofill=X   density after engine greedily fills what the agent left.\n"
         f"               greedy=X      pure greedy baseline (no agent) on same configs.\n"
         f"               placed=A/B vs G  avg parts placed across {args.n_eval_configs} configs:\n"
