@@ -456,8 +456,11 @@ class UNestingGymEnv:
                 continue
             verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
             part_canvas = _rasterize_polygon(verts_px, self.IMG_SIZE)
-            part_dist   = distance_transform_edt(~part_canvas).astype(np.float32)
-            result_dist = np.minimum(base_dist, part_dist)
+            # Same fast approximation as preview_images_per_rotation: copy base_dist
+            # and zero-fill the placement footprint. Avoids a per-part EDT call
+            # (the per-part EDT was the eval bottleneck and also inconsistent with
+            # how training observations are computed).
+            result_dist = base_dist.copy()
             result_dist[base_canvas | part_canvas] = 0.0
             result[ep_id, 1] = np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
 
