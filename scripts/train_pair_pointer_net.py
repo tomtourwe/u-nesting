@@ -806,30 +806,45 @@ def train(args: argparse.Namespace) -> None:
     best_density      = 0.0
     last_eval_density = 0.0
 
+    # Accumulators for batched PPO updates
+    batch_log_probs:    list = []
+    batch_entropies:    list = []
+    batch_rot_ents:     list = []
+    batch_advantages:   list = []
+    batch_observations: list = []
+
     for episode in range(args.episodes):
         t0         = time.perf_counter()
         n_parts_ep = _curriculum_n_parts(episode, args)
         lib_ids    = fixed_lib_ids or env.sample_episode_ids(n=n_parts_ep, rng=rng)
         model.train()
         with torch.no_grad():
-            # Rollout: no graph needed — log_probs are detached, values are detached
             log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
                 env, model, lib_ids, device, gamma=args.gamma,
                 gae_lambda=args.gae_lambda, rotations_rad=rotations_rad,
             )
 
+        # Accumulate rollout data
+        batch_log_probs.extend(log_probs)
+        batch_entropies.extend(entropies)
+        batch_rot_ents.extend(rot_entropies)
+        batch_advantages.extend(advantages)
+        batch_observations.extend(observations)
+
         entropy_coef   = _current_entropy_coef(episode, args)
         imitation_coef = _current_imitation_coef(episode, args)
 
-        if log_probs:
-            old_log_probs  = [lp.detach() for lp in log_probs]
-            value_targets  = [obs[5].item() for obs in observations]
+        # PPO update every episodes_per_update episodes
+        do_update = (episode + 1) % args.episodes_per_update == 0
+        if do_update and batch_log_probs:
+            old_log_probs = [lp.detach() for lp in batch_log_probs]
+            value_targets = [obs[5].item() for obs in batch_observations]
             for _ in range(args.ppo_epochs):
                 new_log_probs, new_entropies, new_rot_entropies, new_imitation, new_value_preds = _evaluate_actions(
-                    model, observations, device)
+                    model, batch_observations, device)
                 loss, entropy_bonus, imitation_loss, rot_entropy, value_loss = _ppo_loss(
                     old_log_probs, new_log_probs, new_entropies, new_imitation,
-                    advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
+                    batch_advantages, entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
                     rot_entropies=new_rot_entropies,
                     rot_entropy_coef=rot_entropy_coef,
                     n_rotations=args.n_rotations,
@@ -845,13 +860,22 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     loss = torch.tensor(0.0)
                     break
+            # Clear accumulators
+            batch_log_probs.clear()
+            batch_entropies.clear()
+            batch_rot_ents.clear()
+            batch_advantages.clear()
+            batch_observations.clear()
+        elif not do_update:
+            loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
+            new_value_preds = []
+            value_targets   = []
         else:
             loss = entropy_bonus = imitation_loss = rot_entropy = value_loss = torch.tensor(0.0)
             new_value_preds = []
             value_targets   = []
 
-        # Value explained variance: 1 - Var(target - pred) / Var(target)
-        # > 0.5 → value net is useful; ~0 → predicting mean; < 0 → broken
+        # Value explained variance
         val_expl_var    = 0.0
         val_mean_target = 0.0
         if value_targets:
@@ -911,8 +935,10 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-parts-start",       type=int,   default=None)
     p.add_argument("--curriculum-episodes", type=int,   default=None)
     p.add_argument("--n-eval-configs",      type=int,   default=20)
-    p.add_argument("--ppo-clip",            type=float, default=0.2)
+    p.add_argument("--ppo-clip",             type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
+    p.add_argument("--episodes-per-update", type=int,   default=4,
+                   help="Accumulate this many episodes before each PPO update (default 4).")
     p.add_argument("--imitation-coef",        type=float, default=0.3,
                    help="Initial imitation loss weight (decays to 0). Set 0 to disable.")
     p.add_argument("--imitation-episodes",   type=int,   default=500,
