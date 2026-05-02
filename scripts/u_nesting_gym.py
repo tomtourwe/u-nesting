@@ -267,17 +267,21 @@ class UNestingGymEnv:
         episode_geoms = self._episode_geoms()
 
         # ── base canvas + board SDF ────────────────────────────────────────
+        # Include a 1-pixel border so the SDF encodes distance to nearest
+        # obstacle (placed part OR plate wall).  Without this, near-wall gaps
+        # look identical to open-centre gaps (both clip to 1.0), hiding the
+        # wasted edge space from the network.
         base_canvas = np.zeros((IMG, IMG), dtype=bool)
+        base_canvas[0, :]  = True   # top wall
+        base_canvas[-1, :] = True   # bottom wall
+        base_canvas[:, 0]  = True   # left wall
+        base_canvas[:, -1] = True   # right wall
         for verts_board in self._board.placed_polygons():
             verts_px = [(x * self._sx, y * self._sy) for x, y in verts_board]
             base_canvas |= _rasterize_polygon(verts_px, IMG)
 
-        if base_canvas.any():
-            base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-            current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
-        else:
-            base_dist   = np.full((IMG, IMG), np.inf, dtype=np.float32)
-            current_sdf = np.ones((IMG, IMG), dtype=np.float32)
+        base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
+        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
 
         # ── batch Rust preview for remaining parts × all rotations ─────────
         remaining_set = set(remaining_eps)
@@ -362,18 +366,18 @@ class UNestingGymEnv:
         episode_geoms = self._episode_geoms()
         geom_id       = episode_geoms[episode_id]["id"]
 
-        # Base board SDF
+        # Base board SDF (plate walls + placed parts)
         base_canvas = np.zeros((IMG, IMG), dtype=bool)
+        base_canvas[0, :]  = True
+        base_canvas[-1, :] = True
+        base_canvas[:, 0]  = True
+        base_canvas[:, -1] = True
         for verts_board in self._board.placed_polygons():
             verts_px = [(x * self._sx, y * self._sy) for x, y in verts_board]
             base_canvas |= _rasterize_polygon(verts_px, IMG)
 
-        if base_canvas.any():
-            base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-            current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
-        else:
-            base_dist   = np.full((IMG, IMG), np.inf, dtype=np.float32)
-            current_sdf = np.ones((IMG, IMG), dtype=np.float32)
+        base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
+        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
 
         raw = self._board.preview_all_per_rotation([geom_id] * R, rotations_rad)
 
@@ -474,19 +478,20 @@ class UNestingGymEnv:
         # Map string_id → board-space vertices (or None)
         preview_map: dict[str, list | None] = dict(zip(remaining_str, preview_verts))
 
-        # --- base canvas: all currently placed parts ---
-        base_canvas = np.zeros((self.IMG_SIZE, self.IMG_SIZE), dtype=bool)
+        # --- base canvas: plate walls + all currently placed parts ---
+        S = self.IMG_SIZE
+        base_canvas = np.zeros((S, S), dtype=bool)
+        base_canvas[0, :]  = True
+        base_canvas[-1, :] = True
+        base_canvas[:, 0]  = True
+        base_canvas[:, -1] = True
         for verts_board in self._board.placed_polygons():
             verts_px = [(x * self._sx, y * self._sy) for x, y in verts_board]
-            base_canvas |= _rasterize_polygon(verts_px, self.IMG_SIZE)
+            base_canvas |= _rasterize_polygon(verts_px, S)
 
         # --- current board SDF (channel 0) ---
-        if base_canvas.any():
-            base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-            current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
-        else:
-            base_dist   = np.full((self.IMG_SIZE, self.IMG_SIZE), np.inf, dtype=np.float32)
-            current_sdf = np.ones((self.IMG_SIZE, self.IMG_SIZE), dtype=np.float32)
+        base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
+        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
 
         # --- result tensor: default both channels to current SDF ---
         result = np.empty((N, 2, self.IMG_SIZE, self.IMG_SIZE), dtype=np.float32)
