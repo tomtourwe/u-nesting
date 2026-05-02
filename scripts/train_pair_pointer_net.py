@@ -781,16 +781,21 @@ def train(args: argparse.Namespace) -> None:
         config_rollout_idx += 1
 
         if config_rollout_idx == args.rollouts_per_config:
-            # Use best and worst rollouts of this config.
-            # Best gets positive advantage, worst gets negative — providing contrast.
-            # Advantage = episode_density - mean_density (same scalar for all steps).
-            mean_density  = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
-            best          = max(cfg_rollouts, key=lambda x: x[0])
-            worst         = min(cfg_rollouts, key=lambda x: x[0])
-            spread        = best[0] - worst[0]
-            for rollout in [best, worst]:
+            # Use top-K and bottom-K rollouts for contrast.
+            # Top rollouts get positive advantage, bottom rollouts get negative.
+            # Advantage = episode_density - mean_density (same scalar for all steps in that rollout).
+            # Middle rollouts (density ≈ mean) are discarded — they add near-zero gradient signal.
+            mean_density = sum(r[0] for r in cfg_rollouts) / len(cfg_rollouts)
+            sorted_rollouts = sorted(cfg_rollouts, key=lambda x: x[0])
+            k = max(1, min(args.contrast_k, len(cfg_rollouts) // 2))
+            top_rollouts    = sorted_rollouts[-k:]   # highest density
+            bottom_rollouts = sorted_rollouts[:k]    # lowest density
+            best  = sorted_rollouts[-1]
+            worst = sorted_rollouts[0]
+            spread = best[0] - worst[0]
+            for rollout in top_rollouts + bottom_rollouts:
                 density, r_lp, r_ent, _, r_obs, _ = rollout
-                adv = density - mean_density  # best: positive, worst: negative
+                adv = density - mean_density
                 r_adv = [adv] * len(r_lp)
                 batch_log_probs.extend(r_lp)
                 batch_entropies.extend(r_ent)
@@ -943,10 +948,14 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",             type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
-    p.add_argument("--rollouts-per-config", type=int,   default=1,
-                   help="Run this many rollouts on the same parts config before sampling a new one (default 1). "
+    p.add_argument("--rollouts-per-config", type=int,   default=8,
+                   help="Run this many rollouts on the same parts config before sampling a new one (default 8). "
                         "Within-group advantage normalization removes config-difficulty variance, "
                         "leaving only policy-quality signal.")
+    p.add_argument("--contrast-k",          type=int,   default=1,
+                   help="Use top-K and bottom-K rollouts for the PPO update (default 1 = best+worst only). "
+                        "Increasing to 2 uses top-2 and bottom-2, giving more gradient data while "
+                        "keeping clear positive/negative contrast. Must be <= rollouts_per_config // 2.")
     p.add_argument("--ppo-mini-batch",      type=int,   default=0,
                    help="Mini-batch size within each PPO epoch (0 = full batch, default 0). "
                         "Set e.g. 16 on GPU to avoid OOM on large configs.")
