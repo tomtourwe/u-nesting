@@ -485,6 +485,7 @@ def _log_training_step(
     episode_time: float,
     rot_entropy: torch.Tensor | None = None,
     policy_loss: torch.Tensor | None = None,
+    episode_entropy: float | None = None,
 ) -> None:
     n_placed = env.n_placed()
 
@@ -532,6 +533,8 @@ def _log_training_step(
         log_dict["loss/rot_entropy"] = rot_entropy.item()
     if policy_loss is not None:
         log_dict["loss/policy"] = policy_loss.item()
+    if episode_entropy is not None:
+        log_dict["agent/entropy"] = episode_entropy  # raw policy entropy, logged every episode
     wandb.log(log_dict, step=episode + 1)
 
 _log_training_step._prev_misses  = 0
@@ -763,6 +766,7 @@ def train(args: argparse.Namespace) -> None:
                 gae_lambda=args.gae_lambda, rotations_rad=rotations_rad,
             )
 
+        episode_entropy = float(torch.stack(entropies).mean().item()) if entropies else None
         cfg_rollouts.append((reward, log_probs, entropies, advantages, observations, stats["n_placed"]))
         config_rollout_idx += 1
 
@@ -874,7 +878,8 @@ def train(args: argparse.Namespace) -> None:
         episode_time = time.perf_counter() - t0
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
                            imitation_loss, imitation_coef, stats, episode_time,
-                           rot_entropy=rot_entropy, policy_loss=policy_loss)
+                           rot_entropy=rot_entropy, policy_loss=policy_loss,
+                           episode_entropy=episode_entropy)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(
