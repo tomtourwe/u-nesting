@@ -4,9 +4,10 @@ Pointer Network architectures for irregular 2D bin-packing via RL.
 Two variants are provided:
 
 SplitPointerNet (default)
-    Separate board CNN and 2-channel part CNN. Board encoded once per step.
-    Each candidate part × rotation is encoded from (delta, result) pair images.
-    Returns (part_logits, rot_feats, ctx) for hierarchical (part, rotation) sampling.
+    Separate board CNN and 3-channel part CNN. Board encoded once per step.
+    Each candidate part × rotation is encoded from (delta, result, isolated_part_sdf)
+    triple images. All N×R (part, rotation) pairs are scored jointly by the same MLP,
+    returning a flat (N, R) logit tensor. Sample from Categorical(logits=joint.reshape(N*R)).
     Trains end-to-end from random init — no pretrained backbone required.
 
 SpatialPointerNet
@@ -19,12 +20,11 @@ Episode loop (SplitPointerNet with rotation)
     env.reset(lib_ids)
     rotations_rad = env.get_rotation_angles(n_rotations=8)
     for step in range(n_parts):
-        obs    = torch.from_numpy(env.preview_images_per_rotation(rotations_rad))
+        obs    = torch.from_numpy(env.preview_images_per_rotation(rotations_rad))  # (N, 2R+1, H, W)
         mask   = build_remaining_mask(env.remaining_item_ids(), N)
-        part_logits, rot_feats, ctx, value = model(obs, mask)  # (N,), (N,R,128), (N,128), ()
-        part_id  = Categorical(logits=part_logits).sample()
-        rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])  # (R,)
-        rot_id   = Categorical(logits=rot_logits).sample()
+        joint_logits = model(obs, mask)                           # (N, R)
+        action_id = Categorical(logits=joint_logits.reshape(N*R)).sample()
+        part_id, rot_id = action_id // R, action_id % R
         env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
 """
 
@@ -139,92 +139,72 @@ class SplitPointerNet(nn.Module):
     """
     Pointer Network with separate board and part encoders. Trains from scratch.
 
+    Scores all N×R (part, rotation) pairs jointly via a Transformer that attends
+    over all N×R tokens — enabling the model to reason about interactions between
+    specific (part_i, rot_r) and (part_j, rot_s) pairs.
+
     Per-step forward (R rotations, N parts):
-        obs = env.preview_images_per_rotation(rotations_rad)  # (N, R+1, 128, 128)
-        board      = obs[0, 0]                                 →  (1, 1, 128, 128)
+        obs = env.preview_images_per_rotation(rotations_rad)  # (N, 2R+1, 128, 128)
         For each (part i, rotation r):
-          delta[i,r]  = obs[i, r+1] − obs[i, 0]              →  (1, 128, 128)
-          result[i,r] = obs[i, r+1]                           →  (1, 128, 128)
-        part_in    = stack all (delta, result) pairs           →  (N*R, 2, 128, 128)
+          delta[i,r]     = obs[i, r+1] − obs[i, 0]
+          result[i,r]    = obs[i, r+1]
+          isolated[i,r]  = obs[i, R+1+r]
+        part_in    = stack triples                             →  (N*R, 3, 128, 128)
         board_feat = board_cnn(board)                          →  (1, 128)
         rot_feats  = part_cnn(part_in).reshape(N, R, 128)     →  (N, R, 128)
-        part_feats = rot_feats.mean(dim=1)                     →  (N, 128)
-        fused      = fusion(cat[board_feat, part_feats])       →  (N, 128)
-        ctx        = PartTransformer(fused, mask)              →  (N, 128)
-        part_logits = part_head(ctx)                           →  (N,)
-        # After sampling part_id:
-        rot_logits = rotation_head(ctx[part_id], rot_feats[part_id])  →  (R,)
+        fused      = fusion(cat[board_feat_exp, rot_feats])    →  (N*R, 128)
+        ctx        = PartTransformer(fused, mask_NR)           →  (N*R, 128)  ← attends over N×R
+        joint_logits = joint_head(ctx).reshape(N, R)           →  (N, R)
     """
 
     def __init__(self):
         super().__init__()
-        self.board_cnn     = _SpatialCNN(in_channels=1)
-        self.part_cnn      = _SpatialCNN(in_channels=2)
-        self.fusion        = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
-        self.part_ctx      = PartTransformer()
-        self.part_head     = nn.Linear(128, 1)
-        self.rotation_head = RotationHead()
-        self.value_head    = nn.Linear(128, 1)
-
-    def rotation_feats_for_part(self, obs_part: torch.Tensor) -> torch.Tensor:
-        """
-        Compute rotation features for a single part without a full forward pass.
-
-        Used in two-phase eval: after the part head selects a part using cheap
-        pair-image observations, this encodes the R rotation candidates for the
-        chosen part only.
-
-        obs_part : (R+1, H, W) — channel 0 = board SDF, channels 1..R = after-SDFs
-        Returns  : (R, 128)
-        """
-        R, H, W  = obs_part.shape[0] - 1, obs_part.shape[1], obs_part.shape[2]
-        current  = obs_part[0].unsqueeze(0).expand(R, H, W).unsqueeze(1)   # (R, 1, H, W)
-        after    = obs_part[1:].unsqueeze(1)                                 # (R, 1, H, W)
-        part_in  = torch.cat([after - current, after], dim=1)               # (R, 2, H, W)
-        return self.part_cnn(part_in)                                        # (R, 128)
+        self.board_cnn  = _SpatialCNN(in_channels=1)
+        self.part_cnn   = _SpatialCNN(in_channels=3)
+        self.fusion     = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
+        self.part_ctx   = PartTransformer()
+        self.joint_head = nn.Linear(128, 1)
 
     def forward(
         self,
-        obs:  torch.Tensor,  # (N, R+1, 128, 128)
+        obs:  torch.Tensor,  # (N, 2R+1, 128, 128)
         mask: torch.Tensor,  # (N,) 1=available, 0=placed
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
-        Score all candidate parts jointly and return per-rotation embeddings.
+        Score all N×R (part, rotation) pairs jointly.
 
         Returns:
-            part_logits : (N,)        placed parts set to −1e9
-            rot_feats   : (N, R, 128) per-(part, rotation) CNN embeddings
-            ctx         : (N, 128)    context-enriched part embeddings
-            value       : ()          scalar state value estimate V(s)
+            joint_logits : (N, R)   placed parts have all R logits set to −1e9
         """
-        N, Rp1, H, W = obs.shape
-        R = Rp1 - 1
+        N, two_Rp1, H, W = obs.shape
+        R = (two_Rp1 - 1) // 2
 
-        board        = obs[0, 0].unsqueeze(0).unsqueeze(0)             # (1, 1, H, W)
-        current_flat = obs[:, 0].unsqueeze(1).expand(N, R, H, W)\
-                           .reshape(N * R, 1, H, W)                    # (N*R, 1, H, W)
-        after_flat   = obs[:, 1:].reshape(N * R, 1, H, W)             # (N*R, 1, H, W)
-        part_in      = torch.cat([after_flat - current_flat,
-                                  after_flat], dim=1)                  # (N*R, 2, H, W)
+        board         = obs[0, 0].unsqueeze(0).unsqueeze(0)            # (1, 1, H, W)
+        current_flat  = obs[:, 0].unsqueeze(1).expand(N, R, H, W)\
+                            .reshape(N * R, 1, H, W)                   # (N*R, 1, H, W)
+        after_flat    = obs[:, 1:R + 1].reshape(N * R, 1, H, W)       # (N*R, 1, H, W)
+        isolated_flat = obs[:, R + 1:2 * R + 1].reshape(N * R, 1, H, W)  # (N*R, 1, H, W)
+        part_in       = torch.cat([after_flat - current_flat,
+                                   after_flat,
+                                   isolated_flat], dim=1)              # (N*R, 3, H, W)
 
         board_feat = self.board_cnn(board)                             # (1, 128)
         rot_feats  = self.part_cnn(part_in).reshape(N, R, 128)        # (N, R, 128)
-        part_feats = rot_feats.mean(dim=1)                             # (N, 128)
 
-        fused = self.fusion(torch.cat([
-            board_feat.expand(N, -1),
-            part_feats,
-        ], dim=-1))                                                     # (N, 128)
+        # Fuse board context into every (part, rotation) token
+        board_exp = board_feat.expand(N * R, -1)                       # (N*R, 128)
+        fused     = self.fusion(torch.cat([
+            board_exp, rot_feats.reshape(N * R, 128),
+        ], dim=-1))                                                     # (N*R, 128)
 
-        ctx    = self.part_ctx(fused, mask)                            # (N, 128)
-        logits = self.part_head(ctx).squeeze(-1)                       # (N,)
+        # Transformer attends over all N×R tokens jointly
+        mask_flat    = mask.unsqueeze(1).expand(N, R).reshape(N * R)  # (N*R,)
+        ctx          = self.part_ctx(fused, mask_flat)                 # (N*R, 128)
+        joint_logits = self.joint_head(ctx).reshape(N, R)             # (N, R)
 
-        remaining_ctx = ctx[mask > 0.5]
-        if remaining_ctx.shape[0] == 0:
-            remaining_ctx = ctx
-        value = self.value_head(remaining_ctx.mean(0)).squeeze()       # scalar
-
-        return logits.masked_fill(mask == 0, -1e9), rot_feats, ctx, value
+        # Mask placed parts: all R logits → -1e9
+        mask_exp = mask.unsqueeze(1).expand(N, R)                      # (N, R)
+        return joint_logits.masked_fill(mask_exp == 0, -1e9)           # (N, R)
 
 
 # ---------------------------------------------------------------------------
@@ -326,24 +306,22 @@ if __name__ == "__main__":
     N_ROTATIONS = 8
     device      = torch.device("cpu")
 
-    # SplitPointerNet — hierarchical (part, rotation) interface
+    # SplitPointerNet — flat joint (N, R) interface
     model = SplitPointerNet().eval()
-    obs   = torch.rand(N_PARTS, N_ROTATIONS + 1, 128, 128)
+    obs   = torch.rand(N_PARTS, 2 * N_ROTATIONS + 1, 128, 128)
     mask  = torch.ones(N_PARTS)
     mask[2] = 0.0
 
-    part_logits, rot_feats, ctx, value = model(obs, mask)
-    assert part_logits.shape == (N_PARTS,),              f"part_logits: {tuple(part_logits.shape)}"
-    assert rot_feats.shape   == (N_PARTS, N_ROTATIONS, 128), f"rot_feats: {tuple(rot_feats.shape)}"
-    assert ctx.shape         == (N_PARTS, 128),          f"ctx: {tuple(ctx.shape)}"
-    assert part_logits[2].item() == -1e9,                "masked part should be -1e9"
-    assert value.shape       == (),                      f"value: {tuple(value.shape)}"
-
-    rot_logits = model.rotation_head(ctx[0], rot_feats[0])
-    assert rot_logits.shape == (N_ROTATIONS,),           f"rot_logits: {tuple(rot_logits.shape)}"
-    print(f"SplitPointerNet shape check OK — part_logits: {tuple(part_logits.shape)}, "
-          f"rot_feats: {tuple(rot_feats.shape)}, rot_logits: {tuple(rot_logits.shape)}, "
-          f"value: scalar")
+    joint_logits = model(obs, mask)
+    assert joint_logits.shape == (N_PARTS, N_ROTATIONS), f"joint_logits: {tuple(joint_logits.shape)}"
+    assert (joint_logits[2] == -1e9).all(), "masked part should have all -1e9 logits"
+    # Sample flat action
+    from torch.distributions import Categorical
+    flat = joint_logits.reshape(N_PARTS * N_ROTATIONS)
+    action_id = Categorical(logits=flat).sample()
+    part_id, rot_id = action_id // N_ROTATIONS, action_id % N_ROTATIONS
+    print(f"SplitPointerNet shape check OK — joint_logits: {tuple(joint_logits.shape)}, "
+          f"sampled part={part_id.item()} rot={rot_id.item()}")
 
     # SpatialPointerNet — unchanged interface (returns (N,) logits directly)
     spatial = SpatialPointerNet().eval()

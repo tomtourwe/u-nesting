@@ -85,55 +85,20 @@ def _build_remaining_mask(remaining_ids: list[int], n_parts: int, device: torch.
     return mask
 
 
-def _sample_action(
-    model: torch.nn.Module,
-    obs_t: torch.Tensor,
-    mask: torch.Tensor,
+def _sample_action_flat(
+    joint_logits: torch.Tensor,
     greedy: bool,
-) -> tuple:
+) -> tuple[torch.Tensor, Categorical, torch.Tensor, torch.Tensor]:
     """
-    Sample a (part, rotation) action from the model.
+    Sample from flat (N*R,) distribution over joint (part, rotation) pairs.
 
-    Returns (part_id, part_dist, part_logits, rot_id, rot_dist, value).
-    rot_id / rot_dist are None when the model does not have a rotation_head.
-    value is None when the model does not have a value_head.
+    Returns (action_id, dist, part_id, rot_id).
     """
-    output = model(obs_t, mask)
-    value = None
-    if isinstance(output, tuple):
-        if len(output) == 4:
-            part_logits, rot_feats, ctx, value = output
-        else:
-            part_logits, rot_feats, ctx = output
-    else:
-        part_logits, rot_feats, ctx = output, None, None
-
-    part_dist = Categorical(logits=part_logits)
-    part_id   = part_logits.argmax() if greedy else part_dist.sample()
-
-    rot_id = rot_dist = None
-    if rot_feats is not None and hasattr(model, "rotation_head"):
-        rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
-        rot_dist   = Categorical(logits=rot_logits)
-        rot_id     = rot_logits.argmax() if greedy else rot_dist.sample()
-
-    return part_id, part_dist, part_logits, rot_id, rot_dist, value
-
-
-def _action_log_prob_and_entropy(
-    part_dist: Categorical,
-    part_id: torch.Tensor,
-    rot_dist: Categorical | None = None,
-    rot_id: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Returns (joint_log_prob, part_entropy, rot_entropy_or_None)."""
-    lp      = part_dist.log_prob(part_id)
-    ent     = part_dist.entropy()
-    rot_ent = None
-    if rot_dist is not None and rot_id is not None:
-        lp      = lp + rot_dist.log_prob(rot_id)
-        rot_ent = rot_dist.entropy()
-    return lp, ent, rot_ent
+    N, R      = joint_logits.shape
+    flat      = joint_logits.reshape(N * R)
+    dist      = Categorical(logits=flat)
+    action_id = flat.argmax() if greedy else dist.sample()
+    return action_id, dist, action_id // R, action_id % R
 
 
 def _polygon_area(polygon: list) -> float:
@@ -163,61 +128,55 @@ def _run_episode(
     gae_lambda: float = 0.95,
     capture_snapshots: bool = False,
     rotations_rad: list[float] | None = None,
-) -> tuple[list, list, list, list[float], float, list, dict, list]:
+) -> tuple[list, list, list[float], float, list, dict, list]:
     env.reset(lib_ids)
     n_parts = len(lib_ids)
 
-    log_probs:     list[torch.Tensor] = []
-    entropies:     list[torch.Tensor] = []
-    rot_entropies: list[torch.Tensor] = []
-    observations:  list[tuple]        = []
-    snapshots:     list               = []
-    R_t_list:      list[float]        = []
-
-    prev_density = env.packing_density()
-    skip_ids: set[int] = set()
+    log_probs:    list[torch.Tensor] = []
+    entropies:    list[torch.Tensor] = []
+    observations: list[tuple]        = []
+    snapshots:    list               = []
+    n_steps: int = 0
 
     for _ in range(n_parts):
-        remaining = [r for r in env.remaining_item_ids() if r not in skip_ids]
+        remaining = env.remaining_item_ids()
         if not remaining:
             break
 
         mask = _build_remaining_mask(remaining, n_parts, device)
 
         if rotations_rad is not None:
+            # New flat joint (N, R) interface — SplitPointerNet
             obs_np = env.preview_images_per_rotation(rotations_rad)
-        else:
-            obs_np = env.preview_pair_images()
-        obs_t = torch.from_numpy(obs_np).to(device, non_blocking=True)
-
-        part_id, part_dist, _, rot_id, rot_dist, _ = _sample_action(model, obs_t, mask, greedy)
-
-        if rotations_rad is not None and rot_id is not None:
+            obs_t  = torch.from_numpy(obs_np).to(device, non_blocking=True)
+            joint_logits            = model(obs_t, mask)           # (N, R)
+            action_id, dist, part_id, rot_id = _sample_action_flat(joint_logits, greedy)
             success = env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
+            if not success:
+                break  # episode ends on first failure — no skip-and-retry during training
+            if not greedy:
+                log_probs.append(dist.log_prob(action_id))
+                entropies.append(dist.entropy())
+                gt = _greedy_target(env, remaining)
+                observations.append((obs_t.cpu(), mask.cpu(), action_id.cpu(), torch.tensor(gt)))
         else:
-            success = env.place_anywhere(part_id.item())
+            # Legacy path — SpatialPointerNet (no rotation head)
+            obs_np = env.preview_pair_images()
+            obs_t  = torch.from_numpy(obs_np).to(device, non_blocking=True)
+            output     = model(obs_t, mask)
+            part_logits = output[0] if isinstance(output, tuple) else output
+            part_dist  = Categorical(logits=part_logits)
+            part_id    = part_logits.argmax() if greedy else part_dist.sample()
+            success    = env.place_anywhere(part_id.item())
+            if not success:
+                break  # episode ends on first failure
+            if not greedy:
+                log_probs.append(part_dist.log_prob(part_id))
+                entropies.append(part_dist.entropy())
+                gt = _greedy_target(env, remaining)
+                observations.append((obs_t.cpu(), mask.cpu(), part_id.cpu(), None, torch.tensor(gt)))
 
-        if not success:
-            skip_ids.add(part_id.item())
-            continue
-
-        if not greedy:
-            lp, ent, rot_ent = _action_log_prob_and_entropy(
-                part_dist, part_id, rot_dist, rot_id)
-            log_probs.append(lp)
-            entropies.append(ent)
-            if rot_ent is not None:
-                rot_entropies.append(rot_ent)
-            gt = _greedy_target(env, remaining)
-            observations.append((
-                obs_t.cpu(), mask.cpu(), part_id.cpu(),
-                rot_id.cpu() if rot_id is not None else None,
-                torch.tensor(gt),
-            ))
-
-        R_t = env.packing_density() - prev_density
-        prev_density = env.packing_density()
-        R_t_list.append(R_t)
+        n_steps += 1
 
         if capture_snapshots:
             snapshots.append((env.placed_polygons(), env.packing_density()))
@@ -225,18 +184,16 @@ def _run_episode(
     # Every step gets the full episode return (final density) as its advantage.
     # The per-config baseline is subtracted later in the training loop, after
     # all K rollouts of the same config have been collected.
-    final_density = env.packing_density()
-    T             = len(R_t_list)
-    A_t_list      = [final_density] * T
-
-    episode_reward = final_density
     board_area     = env.plate_w * env.plate_h
+    episode_reward = env.packing_density() * env.bbox_area() / board_area  # placed_area / board_area
+    A_t_list       = [episode_reward] * n_steps
 
     stats = {
         "bbox_frac": env.bbox_area() / board_area,
+        "n_placed":  env.n_placed(),
     }
 
-    return log_probs, entropies, rot_entropies, A_t_list, episode_reward, snapshots, stats, observations
+    return log_probs, entropies, A_t_list, episode_reward, snapshots, stats, observations
 
 
 def _build_env(args: argparse.Namespace) -> UNestingGymEnv:
@@ -289,39 +246,51 @@ def _evaluate_actions(
     observations: list[tuple],
     device: torch.device,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, part_entropies, rot_entropies, imitation_losses = [], [], [], []
+    log_probs, entropies, rot_entropies, imitation_losses = [], [], [], []
     for obs_entry in observations:
-        obs_t, mask, part_id, rot_id, greedy_target = obs_entry
-        obs_t   = obs_t.to(device,   non_blocking=True)
-        mask    = mask.to(device,    non_blocking=True)
-        part_id = part_id.to(device, non_blocking=True)
+        if len(obs_entry) == 4:
+            # New flat joint format: (obs_t, mask, action_id, greedy_target)
+            obs_t, mask, action_id, greedy_target = obs_entry
+            obs_t     = obs_t.to(device,     non_blocking=True)
+            mask      = mask.to(device,      non_blocking=True)
+            action_id = action_id.to(device, non_blocking=True)
 
-        with _autocast(device):
-            output = model(obs_t, mask)
-            if isinstance(output, tuple):
-                part_logits, rot_feats, ctx = output[0], output[1], output[2]
-            else:
-                part_logits, rot_feats, ctx = output, None, None
+            with _autocast(device):
+                joint_logits = model(obs_t, mask)                          # (N, R)
+            N, R = joint_logits.shape
+            flat_dist = Categorical(logits=joint_logits.reshape(N * R))
+            log_probs.append(flat_dist.log_prob(action_id))
+            entropies.append(flat_dist.entropy())
+            # Imitation: marginalise over rotations via logsumexp → part logits
+            part_logits_imit = joint_logits.logsumexp(dim=1)              # (N,)
+            imitation_losses.append(
+                F.cross_entropy(
+                    part_logits_imit.unsqueeze(0),
+                    greedy_target.unsqueeze(0).to(device, non_blocking=True),
+                )
+            )
+        else:
+            # Legacy format: (obs_t, mask, part_id, rot_id, greedy_target)
+            obs_t, mask, part_id, rot_id, greedy_target = obs_entry
+            obs_t   = obs_t.to(device,   non_blocking=True)
+            mask    = mask.to(device,    non_blocking=True)
+            part_id = part_id.to(device, non_blocking=True)
 
-            if rot_feats is not None and rot_id is not None and hasattr(model, "rotation_head"):
-                rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
-                rot_dist   = Categorical(logits=rot_logits)
-                rot_entropies.append(rot_dist.entropy())
-            else:
-                rot_dist = None
+            with _autocast(device):
+                output = model(obs_t, mask)
+                part_logits = output[0] if isinstance(output, tuple) else output
 
-        part_dist = Categorical(logits=part_logits)
-        lp        = part_dist.log_prob(part_id)
-        part_entropies.append(part_dist.entropy())
+            part_dist = Categorical(logits=part_logits)
+            log_probs.append(part_dist.log_prob(part_id))
+            entropies.append(part_dist.entropy())
+            imitation_losses.append(
+                F.cross_entropy(
+                    part_logits.unsqueeze(0),
+                    greedy_target.unsqueeze(0).to(device, non_blocking=True),
+                )
+            )
 
-        if rot_dist is not None:
-            lp = lp + rot_dist.log_prob(rot_id.to(device, non_blocking=True))
-
-        log_probs.append(lp)
-        imitation_losses.append(
-            F.cross_entropy(part_logits.unsqueeze(0), greedy_target.unsqueeze(0).to(device, non_blocking=True))
-        )
-    return log_probs, part_entropies, rot_entropies, imitation_losses
+    return log_probs, entropies, rot_entropies, imitation_losses
 
 
 def _ppo_loss(
@@ -332,27 +301,21 @@ def _ppo_loss(
     advantages: list[float],
     entropy_coef: float,
     imitation_coef: float,
-    n_parts: int,
+    n_actions: int,
     clip_eps: float,
     device: torch.device,
-    rot_entropies: list[torch.Tensor] | None = None,
-    rot_entropy_coef: float = 0.0,
-    n_rotations: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    adv     = torch.tensor(advantages, dtype=torch.float32, device=device)
-    old_lp  = torch.stack(old_log_probs).detach()
-    new_lp  = torch.stack(new_log_probs)
-    ratio   = (new_lp - old_lp).exp()
-    clipped = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    adv            = torch.tensor(advantages, dtype=torch.float32, device=device)
+    old_lp         = torch.stack(old_log_probs).detach()
+    new_lp         = torch.stack(new_log_probs)
+    ratio          = (new_lp - old_lp).exp()
+    clipped        = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
     policy_loss    = -torch.min(ratio * adv, clipped * adv).mean()
-    part_entropy   = torch.stack(entropies).mean() / math.log(max(n_parts, 2))
+    entropy        = torch.stack(entropies).mean() / math.log(max(n_actions, 2))
     imitation_loss = torch.stack(imitation_losses).mean()
-    total = policy_loss - entropy_coef * part_entropy + imitation_coef * imitation_loss
-    rot_entropy = torch.tensor(0.0, device=device)
-    if rot_entropies:
-        rot_entropy = torch.stack(rot_entropies).mean() / math.log(max(n_rotations, 2))
-        total = total - rot_entropy_coef * rot_entropy
-    return total, part_entropy, imitation_loss, rot_entropy, policy_loss
+    total          = policy_loss - entropy_coef * entropy + imitation_coef * imitation_loss
+    rot_entropy    = torch.tensor(0.0, device=device)   # kept for logging compat
+    return total, entropy, imitation_loss, rot_entropy, policy_loss
 
 
 def _run_greedy_eval(
@@ -389,17 +352,17 @@ def _run_greedy_eval(
             mask = _build_remaining_mask(remaining, n_parts, device)
 
             if rotations_rad is not None:
-                # Same observation as training: (N, R+1, H, W) with all rotations
+                # New flat joint (N, R) interface — SplitPointerNet
                 obs = torch.from_numpy(
                     env.preview_images_per_rotation(rotations_rad)
                 ).to(device, non_blocking=True)
                 with _autocast(device):
-                    part_logits, rot_feats, ctx, _ = model(obs, mask)
-                part_id    = int(part_logits.argmax().item())
-                with _autocast(device):
-                    rot_logits = model.rotation_head(ctx[part_id], rot_feats[part_id])
-                rot_id  = int(rot_logits.argmax().item())
-                success = env.place_with_rotation(part_id, rotations_rad[rot_id])
+                    joint_logits = model(obs, mask)                    # (N, R)
+                N_out, R_out = joint_logits.shape
+                action_id = int(joint_logits.reshape(N_out * R_out).argmax().item())
+                part_id   = action_id // R_out
+                rot_id    = action_id % R_out
+                success   = env.place_with_rotation(part_id, rotations_rad[rot_id])
             else:
                 obs = torch.from_numpy(env.preview_pair_images()).to(device, non_blocking=True)
                 with _autocast(device):
@@ -744,15 +707,12 @@ def train(args: argparse.Namespace) -> None:
         if args.model == "split" and args.n_rotations > 0
         else None
     )
-    rot_entropy_coef = args.rot_entropy_coef if args.rot_entropy_coef is not None else args.entropy_coef
-
     best_density      = 0.0
     last_eval_density = 0.0
 
     # Accumulators for batched PPO updates
     batch_log_probs:    list = []
     batch_entropies:    list = []
-    batch_rot_ents:     list = []
     batch_advantages:   list = []
     batch_observations: list = []
 
@@ -761,7 +721,7 @@ def train(args: argparse.Namespace) -> None:
     current_lib_ids:    list[int] | None = None
     n_parts_ep:         int  = 0
     # Buffer for K rollouts of the same config; each entry is
-    # (episode_reward, log_probs, entropies, rot_entropies, advantages, observations)
+    # (episode_reward, log_probs, entropies, advantages, observations)
     cfg_rollouts: list[tuple] = []
 
     for episode in range(args.episodes):
@@ -775,12 +735,12 @@ def train(args: argparse.Namespace) -> None:
 
         model.train()
         with torch.no_grad():
-            log_probs, entropies, rot_entropies, advantages, reward, _, stats, observations = _run_episode(
+            log_probs, entropies, advantages, reward, _, stats, observations = _run_episode(
                 env, model, lib_ids, device, gamma=args.gamma,
                 gae_lambda=args.gae_lambda, rotations_rad=rotations_rad,
             )
 
-        cfg_rollouts.append((reward, log_probs, entropies, rot_entropies, advantages, observations))
+        cfg_rollouts.append((reward, log_probs, entropies, advantages, observations, stats["n_placed"]))
         config_rollout_idx += 1
 
         if config_rollout_idx == args.rollouts_per_config:
@@ -792,12 +752,11 @@ def train(args: argparse.Namespace) -> None:
             worst         = min(cfg_rollouts, key=lambda x: x[0])
             spread        = best[0] - worst[0]
             for rollout in [best, worst]:
-                density, r_lp, r_ent, r_rot, _, r_obs = rollout
+                density, r_lp, r_ent, _, r_obs, _ = rollout
                 adv = density - mean_density  # best: positive, worst: negative
                 r_adv = [adv] * len(r_lp)
                 batch_log_probs.extend(r_lp)
                 batch_entropies.extend(r_ent)
-                batch_rot_ents.extend(r_rot)
                 batch_advantages.extend(r_adv)
                 batch_observations.extend(r_obs)
             wandb.log({
@@ -808,7 +767,7 @@ def train(args: argparse.Namespace) -> None:
                 "config/adv_best":       best[0]  - mean_density,
                 "config/adv_worst":      worst[0] - mean_density,
             }, step=episode + 1)
-            print(f"  → config: best={best[0]:.4f}  worst={worst[0]:.4f}  spread={spread:.4f}")
+            print(f"  → config: best={best[0]:.4f}({best[5]}p)  worst={worst[0]:.4f}({worst[5]}p)  spread={spread:.4f}")
             cfg_rollouts.clear()
             config_rollout_idx = 0
 
@@ -843,15 +802,14 @@ def train(args: argparse.Namespace) -> None:
                     chunk_old = old_log_probs[start : start + mini_bs]
                     chunk_adv = norm_adv[start : start + mini_bs]
 
-                    new_lp, new_ent, new_rot_ent, new_imit = _evaluate_actions(
+                    new_lp, new_ent, _new_rot_ent, new_imit = _evaluate_actions(
                         model, chunk_obs, device)
 
+                    n_actions = (n_parts_ep * args.n_rotations
+                                 if rotations_rad is not None else n_parts_ep)
                     chunk_loss, ent_b, imit_l, rot_e, pol_l = _ppo_loss(
                         chunk_old, new_lp, new_ent, new_imit, chunk_adv,
-                        entropy_coef, imitation_coef, n_parts_ep, args.ppo_clip, device,
-                        rot_entropies=new_rot_ent,
-                        rot_entropy_coef=rot_entropy_coef,
-                        n_rotations=args.n_rotations,
+                        entropy_coef, imitation_coef, n_actions, args.ppo_clip, device,
                     )
 
                     if not torch.isfinite(chunk_loss):
@@ -882,7 +840,6 @@ def train(args: argparse.Namespace) -> None:
 
             batch_log_probs.clear()
             batch_entropies.clear()
-            batch_rot_ents.clear()
             batch_advantages.clear()
             batch_observations.clear()
             current_lib_ids = None

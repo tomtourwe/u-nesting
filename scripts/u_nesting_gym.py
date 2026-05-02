@@ -224,13 +224,18 @@ class UNestingGymEnv:
 
     def preview_images_per_rotation(self, rotations_rad: list[float]) -> np.ndarray:
         """
-        Build (N, R+1, IMG_SIZE, IMG_SIZE) observation images.
+        Build (N, 2R+1, IMG_SIZE, IMG_SIZE) observation images.
 
-        Channel 0      : current board SDF (same for all N parts).
-        Channels 1..R+1: hypothetical board SDF after placing part i at
-                         rotation rotations_rad[r].  Falls back to the current
-                         SDF if the part is already placed or doesn't fit at
-                         that rotation.
+        Channel 0        : current board SDF (same for all N parts).
+        Channels 1..R+1  : hypothetical board SDF after placing part i at
+                           rotation rotations_rad[r].  Falls back to the current
+                           SDF if the part is already placed or doesn't fit at
+                           that rotation.
+        Channels R+1..2R+1: isolated part SDF at each rotation (part only,
+                           centered on canvas, no board context). Lets the
+                           network distinguish part shapes independently of
+                           placement position.  Falls back to all-ones (no-part
+                           signal) when the part doesn't fit at that rotation.
 
         Uses the same min-distance EDT trick as preview_pair_images:
         EDT runs once on the base board and once per (part, rotation) candidate.
@@ -239,13 +244,14 @@ class UNestingGymEnv:
             rotations_rad: list of R rotation angles in radians.
 
         Returns:
-            np.ndarray of shape (N, R+1, IMG_SIZE, IMG_SIZE), dtype float32.
+            np.ndarray of shape (N, 2R+1, IMG_SIZE, IMG_SIZE), dtype float32.
         """
         from scipy.ndimage import distance_transform_edt
 
         R             = len(rotations_rad)
         N             = len(self._episode_geoms())
         IMG           = self.IMG_SIZE
+        half          = IMG / 2.0
         remaining_eps = self.remaining_item_ids()
         episode_geoms = self._episode_geoms()
 
@@ -277,25 +283,37 @@ class UNestingGymEnv:
         raw = self._board.preview_all_per_rotation(flat_ids, flat_rots)  # N×R entries
 
         # ── assemble result tensor ─────────────────────────────────────────
-        result = np.empty((N, R + 1, IMG, IMG), dtype=np.float32)
+        result = np.empty((N, 2 * R + 1, IMG, IMG), dtype=np.float32)
         result[:, 0] = current_sdf
+        no_part_sdf = np.ones((IMG, IMG), dtype=np.float32)  # fallback isolated channel
 
         for ep in range(N):
             for r_idx in range(R):
                 verts_board = raw[ep * R + r_idx]
                 if verts_board is None or ep not in remaining_set:
-                    result[ep, r_idx + 1] = current_sdf
+                    result[ep, r_idx + 1]     = current_sdf
+                    result[ep, R + 1 + r_idx] = no_part_sdf
                 else:
                     verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
                     part_canvas = _rasterize_polygon(verts_px, IMG)
-                    # Use base_dist (board SDF) and zero-fill where the placed part
-                    # lands — avoids a per-(part,rotation) EDT call (was the bottleneck).
-                    # The board SDF halo around existing parts is preserved; the network
-                    # sees the placement footprint directly from the zero region.
+
+                    # Board+part SDF: zero-fill placement footprint into base_dist
                     result_dist = base_dist.copy()
                     result_dist[base_canvas | part_canvas] = 0.0
                     result[ep, r_idx + 1] = (
                         np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+                    )
+
+                    # Isolated part SDF: center the (rotated) part on a blank canvas
+                    xs = [p[0] for p in verts_px]
+                    ys = [p[1] for p in verts_px]
+                    cx = (min(xs) + max(xs)) / 2.0
+                    cy = (min(ys) + max(ys)) / 2.0
+                    centered = [(x + half - cx, y + half - cy) for x, y in verts_px]
+                    part_only = _rasterize_polygon(centered, IMG)
+                    part_dist_arr = distance_transform_edt(~part_only).astype(np.float32)
+                    result[ep, R + 1 + r_idx] = (
+                        np.clip(part_dist_arr, 0, self._sdf_clip_px) / self._sdf_clip_px
                     )
 
         return result
