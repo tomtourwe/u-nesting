@@ -20,7 +20,9 @@ Episode loop (SplitPointerNet with rotation)
     env.reset(lib_ids)
     rotations_rad = env.get_rotation_angles(n_rotations=8)
     for step in range(n_parts):
-        obs    = torch.from_numpy(env.preview_images_per_rotation(rotations_rad))  # (N, 2R+1, H, W)
+        obs_np, sc_np = env.preview_images_per_rotation(rotations_rad)
+        obs     = torch.from_numpy(obs_np)  # (N, 2R+1, H, W)
+        scalars = torch.from_numpy(sc_np)   # (N, R, 3)
         mask   = build_remaining_mask(env.remaining_item_ids(), N)
         joint_logits = model(obs, mask)                           # (N, R)
         action_id = Categorical(logits=joint_logits.reshape(N*R)).sample()
@@ -191,7 +193,7 @@ class SplitPointerNet(nn.Module):
     specific (part_i, rot_r) and (part_j, rot_s) pairs.
 
     Per-step forward (R rotations, N parts):
-        obs = env.preview_images_per_rotation(rotations_rad)  # (N, 2R+1, 128, 128)
+        obs, scalars = env.preview_images_per_rotation(rotations_rad)  # (N,2R+1,H,W), (N,R,3)
         For each (part i, rotation r):
           delta[i,r]     = obs[i, r+1] − obs[i, 0]
           result[i,r]    = obs[i, r+1]
@@ -211,22 +213,31 @@ class SplitPointerNet(nn.Module):
                           "vit" — _PatchViT with 16×16 patches, preserves full geometry.
         """
         super().__init__()
-        self.board_cnn  = _SpatialCNN(in_channels=1)
+        self.board_cnn   = _SpatialCNN(in_channels=1)
         if part_encoder == "vit":
             self.part_cnn = _PatchViT(in_channels=3, patch_size=16)
         else:
             self.part_cnn = _SpatialCNN(in_channels=3)
-        self.fusion     = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
-        self.part_ctx   = PartTransformer()
-        self.joint_head = nn.Linear(128, 1)
+        self.fusion      = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
+        # Scalar features: area_frac, bbox_w, bbox_h (z-scored across N parts).
+        # Injected additively into the fused token so the network can directly
+        # compare relative sizes without re-deriving them from the image.
+        self.scalar_proj = nn.Linear(3, 128)
+        self.part_ctx    = PartTransformer()
+        self.joint_head  = nn.Linear(128, 1)
 
     def forward(
         self,
-        obs:  torch.Tensor,  # (N, 2R+1, 128, 128)
-        mask: torch.Tensor,  # (N,) 1=available, 0=placed
+        obs:     torch.Tensor,            # (N, 2R+1, 128, 128)
+        mask:    torch.Tensor,            # (N,) 1=available, 0=placed
+        scalars: torch.Tensor | None = None,  # (N, R, 3) z-scored, or None
     ) -> torch.Tensor:
         """
         Score all N×R (part, rotation) pairs jointly.
+
+        scalars: per-(part,rotation) features [area_frac, bbox_w, bbox_h] z-scored
+                 across N parts. Injected additively after fusion so the network
+                 can directly compare relative sizes. Pass None to skip (legacy).
 
         Returns:
             joint_logits : (N, R)   placed parts have all R logits set to −1e9
@@ -251,6 +262,10 @@ class SplitPointerNet(nn.Module):
         fused     = self.fusion(torch.cat([
             board_exp, rot_feats.reshape(N * R, 128),
         ], dim=-1))                                                     # (N*R, 128)
+
+        # Inject scalar geometry features (area, bbox w/h) as additive residual
+        if scalars is not None:
+            fused = fused + self.scalar_proj(scalars.reshape(N * R, 3))  # (N*R, 128)
 
         # Transformer attends over all N×R tokens jointly
         mask_flat    = mask.unsqueeze(1).expand(N, R).reshape(N * R)  # (N*R,)

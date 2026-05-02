@@ -147,9 +147,10 @@ def _run_episode(
 
         if rotations_rad is not None:
             # New flat joint (N, R) interface — SplitPointerNet
-            obs_np = env.preview_images_per_rotation(rotations_rad)
-            obs_t  = torch.from_numpy(obs_np).to(device, non_blocking=True)
-            joint_logits            = model(obs_t, mask)           # (N, R)
+            obs_np, scalars_np = env.preview_images_per_rotation(rotations_rad)
+            obs_t     = torch.from_numpy(obs_np).to(device, non_blocking=True)
+            scalars_t = torch.from_numpy(scalars_np).to(device, non_blocking=True)
+            joint_logits            = model(obs_t, mask, scalars_t)  # (N, R)
             action_id, dist, part_id, rot_id = _sample_action_flat(joint_logits, greedy)
             success = env.place_with_rotation(part_id.item(), rotations_rad[rot_id.item()])
             if not success:
@@ -158,7 +159,7 @@ def _run_episode(
                 log_probs.append(dist.log_prob(action_id))
                 entropies.append(dist.entropy())
                 gt = _greedy_target(env, remaining)
-                observations.append((obs_t.cpu(), mask.cpu(), action_id.cpu(), torch.tensor(gt)))
+                observations.append((obs_t.cpu(), mask.cpu(), action_id.cpu(), torch.tensor(gt), scalars_t.cpu()))
         else:
             # Legacy path — SpatialPointerNet (no rotation head)
             obs_np = env.preview_pair_images()
@@ -249,8 +250,30 @@ def _evaluate_actions(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
     log_probs, entropies, rot_entropies, imitation_losses = [], [], [], []
     for obs_entry in observations:
-        if len(obs_entry) == 4:
-            # New flat joint format: (obs_t, mask, action_id, greedy_target)
+        if len(obs_entry) == 5 and obs_entry[3] is not None and obs_entry[4].dim() == 3:
+            # New flat joint format with scalars: (obs_t, mask, action_id, greedy_target, scalars_t)
+            obs_t, mask, action_id, greedy_target, scalars_t = obs_entry
+            obs_t     = obs_t.to(device,      non_blocking=True)
+            mask      = mask.to(device,       non_blocking=True)
+            action_id = action_id.to(device,  non_blocking=True)
+            scalars_t = scalars_t.to(device,  non_blocking=True)
+
+            with _autocast(device):
+                joint_logits = model(obs_t, mask, scalars_t)              # (N, R)
+            N, R = joint_logits.shape
+            flat_dist = Categorical(logits=joint_logits.reshape(N * R))
+            log_probs.append(flat_dist.log_prob(action_id))
+            entropies.append(flat_dist.entropy())
+            # Imitation: marginalise over rotations via logsumexp → part logits
+            part_logits_imit = joint_logits.logsumexp(dim=1)              # (N,)
+            imitation_losses.append(
+                F.cross_entropy(
+                    part_logits_imit.unsqueeze(0),
+                    greedy_target.unsqueeze(0).to(device, non_blocking=True),
+                )
+            )
+        elif len(obs_entry) == 4:
+            # Old flat joint format without scalars: (obs_t, mask, action_id, greedy_target)
             obs_t, mask, action_id, greedy_target = obs_entry
             obs_t     = obs_t.to(device,     non_blocking=True)
             mask      = mask.to(device,      non_blocking=True)
@@ -262,7 +285,6 @@ def _evaluate_actions(
             flat_dist = Categorical(logits=joint_logits.reshape(N * R))
             log_probs.append(flat_dist.log_prob(action_id))
             entropies.append(flat_dist.entropy())
-            # Imitation: marginalise over rotations via logsumexp → part logits
             part_logits_imit = joint_logits.logsumexp(dim=1)              # (N,)
             imitation_losses.append(
                 F.cross_entropy(
@@ -354,11 +376,11 @@ def _run_greedy_eval(
 
             if rotations_rad is not None:
                 # New flat joint (N, R) interface — SplitPointerNet
-                obs = torch.from_numpy(
-                    env.preview_images_per_rotation(rotations_rad)
-                ).to(device, non_blocking=True)
+                obs_np, scalars_np = env.preview_images_per_rotation(rotations_rad)
+                obs       = torch.from_numpy(obs_np).to(device, non_blocking=True)
+                scalars_t = torch.from_numpy(scalars_np).to(device, non_blocking=True)
                 with _autocast(device):
-                    joint_logits = model(obs, mask)                    # (N, R)
+                    joint_logits = model(obs, mask, scalars_t)         # (N, R)
                 N_out, R_out = joint_logits.shape
                 action_id = int(joint_logits.reshape(N_out * R_out).argmax().item())
                 part_id   = action_id // R_out

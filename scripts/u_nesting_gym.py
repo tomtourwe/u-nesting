@@ -222,9 +222,12 @@ class UNestingGymEnv:
         import math
         return [2 * math.pi * r / n_rotations for r in range(n_rotations)]
 
-    def preview_images_per_rotation(self, rotations_rad: list[float]) -> np.ndarray:
+    def preview_images_per_rotation(
+        self, rotations_rad: list[float]
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Build (N, 2R+1, IMG_SIZE, IMG_SIZE) observation images.
+        Build (N, 2R+1, IMG_SIZE, IMG_SIZE) observation images plus per-(part,rotation)
+        scalar features.
 
         Channel 0        : current board SDF (same for all N parts).
         Channels 1..R+1  : hypothetical board SDF after placing part i at
@@ -237,6 +240,13 @@ class UNestingGymEnv:
                            placement position.  Falls back to all-ones (no-part
                            signal) when the part doesn't fit at that rotation.
 
+        Scalar features (N, R, 3) — z-scored across N parts per rotation per feature
+        so that even small size differences become discriminatory:
+            feat[0] = part pixel area / (IMG*IMG)   (relative footprint)
+            feat[1] = bbox_width  / IMG             (normalised width)
+            feat[2] = bbox_height / IMG             (normalised height)
+        Fallback value for non-fitting (part, rotation) pairs: 0.0 before z-scoring.
+
         Uses the same min-distance EDT trick as preview_pair_images:
         EDT runs once on the base board and once per (part, rotation) candidate.
 
@@ -244,7 +254,8 @@ class UNestingGymEnv:
             rotations_rad: list of R rotation angles in radians.
 
         Returns:
-            np.ndarray of shape (N, 2R+1, IMG_SIZE, IMG_SIZE), dtype float32.
+            images  : np.ndarray of shape (N, 2R+1, IMG_SIZE, IMG_SIZE), dtype float32.
+            scalars : np.ndarray of shape (N, R, 3), dtype float32, z-scored across N.
         """
         from scipy.ndimage import distance_transform_edt
 
@@ -283,7 +294,8 @@ class UNestingGymEnv:
         raw = self._board.preview_all_per_rotation(flat_ids, flat_rots)  # N×R entries
 
         # ── assemble result tensor ─────────────────────────────────────────
-        result = np.empty((N, 2 * R + 1, IMG, IMG), dtype=np.float32)
+        result  = np.empty((N, 2 * R + 1, IMG, IMG), dtype=np.float32)
+        scalars = np.zeros((N, R, 3), dtype=np.float32)   # [area_frac, bbox_w, bbox_h]
         result[:, 0] = current_sdf
         no_part_sdf = np.ones((IMG, IMG), dtype=np.float32)  # fallback isolated channel
 
@@ -293,6 +305,7 @@ class UNestingGymEnv:
                 if verts_board is None or ep not in remaining_set:
                     result[ep, r_idx + 1]     = current_sdf
                     result[ep, R + 1 + r_idx] = no_part_sdf
+                    # scalars stay 0 for non-fitting pairs
                 else:
                     verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
                     part_canvas = _rasterize_polygon(verts_px, IMG)
@@ -316,7 +329,20 @@ class UNestingGymEnv:
                         np.clip(part_dist_arr, 0, self._sdf_clip_px) / self._sdf_clip_px
                     )
 
-        return result
+                    # Scalar features: area, bbox width, bbox height (all in [0,1])
+                    scalars[ep, r_idx, 0] = float(part_canvas.sum()) / (IMG * IMG)
+                    scalars[ep, r_idx, 1] = (max(xs) - min(xs)) / IMG
+                    scalars[ep, r_idx, 2] = (max(ys) - min(ys)) / IMG
+
+        # Z-score each feature across N parts per rotation so small differences become
+        # discriminatory.  When std≈0 (truly identical shapes) everything goes to 0,
+        # which is correct — no information to convey.
+        eps = 1e-6
+        mean = scalars.mean(axis=0, keepdims=True)   # (1, R, 3)
+        std  = scalars.std(axis=0, keepdims=True)    # (1, R, 3)
+        scalars = (scalars - mean) / (std + eps)
+
+        return result, scalars
 
     def preview_images_for_part(self, episode_id: int, rotations_rad: list[float]) -> np.ndarray:
         """
