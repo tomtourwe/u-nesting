@@ -135,6 +135,53 @@ class _SpatialCNN(nn.Module):
         return self.proj(self.conv(x))
 
 
+class _PatchViT(nn.Module):
+    """
+    Small Vision Transformer encoder for SDF images.
+
+    Divides the input into non-overlapping patches, projects each to a token,
+    then runs a lightweight Transformer. The CLS token is used as the output
+    embedding. No positional encoding is learned — patch order is fixed.
+
+    Input:  (B, in_channels, 128, 128)
+    Output: (B, 128)
+
+    With patch_size=16: 8×8 = 64 patches per image.
+    With patch_size=8:  16×16 = 256 patches per image (more detail, more compute).
+    """
+
+    def __init__(self, in_channels: int = 1, patch_size: int = 16, dim: int = 128, n_heads: int = 4, n_layers: int = 2):
+        super().__init__()
+        n_patches    = (128 // patch_size) ** 2
+        patch_dim    = in_channels * patch_size * patch_size
+        self.patch_size = patch_size
+        self.patch_proj = nn.Linear(patch_dim, dim)
+        self.cls_token  = nn.Parameter(torch.randn(1, 1, dim) * 0.02)
+        self.pos_embed  = nn.Parameter(torch.randn(1, n_patches + 1, dim) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim, nhead=n_heads, dim_feedforward=dim * 2,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        p = self.patch_size
+        # Patchify: (B, n_patches, patch_dim)
+        x = x.unfold(2, p, p).unfold(3, p, p)          # (B, C, H/p, W/p, p, p)
+        x = x.contiguous().view(B, C, -1, p * p)        # (B, C, n_patches, p²)
+        x = x.permute(0, 2, 1, 3).contiguous()          # (B, n_patches, C, p²)
+        x = x.view(B, x.shape[1], -1)                   # (B, n_patches, C*p²)
+        x = self.patch_proj(x)                           # (B, n_patches, dim)
+        # Prepend CLS token
+        cls = self.cls_token.expand(B, -1, -1)           # (B, 1, dim)
+        x   = torch.cat([cls, x], dim=1)                 # (B, n_patches+1, dim)
+        x   = x + self.pos_embed
+        x   = self.transformer(x)                        # (B, n_patches+1, dim)
+        return self.norm(x[:, 0])                        # (B, dim) — CLS token
+
+
 class SplitPointerNet(nn.Module):
     """
     Pointer Network with separate board and part encoders. Trains from scratch.
@@ -157,10 +204,18 @@ class SplitPointerNet(nn.Module):
         joint_logits = joint_head(ctx).reshape(N, R)           →  (N, R)
     """
 
-    def __init__(self):
+    def __init__(self, part_encoder: str = "cnn"):
+        """
+        Args:
+            part_encoder: "cnn" (default) — _SpatialCNN with 2×2 adaptive pool.
+                          "vit" — _PatchViT with 16×16 patches, preserves full geometry.
+        """
         super().__init__()
         self.board_cnn  = _SpatialCNN(in_channels=1)
-        self.part_cnn   = _SpatialCNN(in_channels=3)
+        if part_encoder == "vit":
+            self.part_cnn = _PatchViT(in_channels=3, patch_size=16)
+        else:
+            self.part_cnn = _SpatialCNN(in_channels=3)
         self.fusion     = nn.Sequential(nn.Linear(256, 128), nn.ReLU(True))
         self.part_ctx   = PartTransformer()
         self.joint_head = nn.Linear(128, 1)

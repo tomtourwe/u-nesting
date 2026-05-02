@@ -217,7 +217,7 @@ def _build_model_and_optimizer(
     if args.model == "spatial":
         model = SpatialPointerNet().to(device)
     else:
-        model = SplitPointerNet().to(device)
+        model = SplitPointerNet(part_encoder=args.part_encoder).to(device)
     if device.type == "cuda":
         # ~30–60% faster on NVIDIA; not supported on MPS
         torch.set_float32_matmul_precision("high")
@@ -229,7 +229,8 @@ def _build_model_and_optimizer(
 
 def _current_entropy_coef(episode: int, args: argparse.Namespace) -> float:
     if args.entropy_coef_final is not None:
-        t = min(1.0, episode / args.episodes)
+        anneal_episodes = args.entropy_anneal_episodes or args.episodes
+        t = min(1.0, episode / anneal_episodes)
         return args.entropy_coef + t * (args.entropy_coef_final - args.entropy_coef)
     return args.entropy_coef
 
@@ -884,9 +885,14 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--lr",                  type=float, default=3e-4)
     p.add_argument("--gamma",               type=float, default=0.99)
     p.add_argument("--entropy-coef",        type=float, default=0.05)
-    p.add_argument("--entropy-coef-final",  type=float, default=None)
+    p.add_argument("--entropy-coef-final",    type=float, default=None)
+    p.add_argument("--entropy-anneal-episodes", type=int, default=None,
+                   help="Episodes over which entropy coef decays to --entropy-coef-final "
+                        "(default: same as --episodes).")
     p.add_argument("--log-interval",        type=int,   default=50)
     p.add_argument("--model",               default="split", choices=["split", "spatial"])
+    p.add_argument("--part-encoder",        default="cnn",   choices=["cnn", "vit"],
+                   help="Part image encoder: 'cnn' (default, _SpatialCNN) or 'vit' (_PatchViT, 16x16 patches).")
     p.add_argument("--out-best",            default=None)
     p.add_argument("--out-last",            default=None)
     p.add_argument("--rng-seed",            type=int,   default=42)
