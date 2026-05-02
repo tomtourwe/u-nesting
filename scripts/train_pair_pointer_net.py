@@ -486,6 +486,7 @@ def _log_training_step(
     rot_entropy: torch.Tensor | None = None,
     policy_loss: torch.Tensor | None = None,
     episode_entropy: float | None = None,
+    entropy_coef: float = 0.0,
 ) -> None:
     n_placed = env.n_placed()
 
@@ -513,16 +514,23 @@ def _log_training_step(
     _log_training_step._prev_misses = misses
     _log_training_step._prev_hits   = hits
 
+    # entropy_bonus here is the RAW normalised entropy [0,1] (not coef×entropy).
+    # Log both the raw value and the weighted loss contribution separately.
+    entropy_norm     = entropy_bonus.item()          # normalised entropy in [0,1]
+    entropy_weighted = entropy_coef * entropy_norm   # actual loss contribution
+
     log_dict = {
         # Agent nesting quality
         "agent/density":            reward,
         "agent/density_ema":        density_ema,
         "agent/parts_placed":       n_placed / n_parts_ep,
         # Policy losses
-        "loss/total":          loss.item(),
-        "loss/entropy":        entropy_bonus.item(),
-        "loss/imitation":      imitation_loss.item(),
-        "loss/imitation_coef": imitation_coef,
+        "loss/total":               loss.item(),
+        "loss/entropy_norm":        entropy_norm,      # raw normalised entropy [0,1]
+        "loss/entropy_weighted":    entropy_weighted,  # coef × entropy (actual loss term)
+        "loss/imitation":           imitation_loss.item(),
+        "loss/imitation_coef":      imitation_coef,
+        "train/entropy_coef":       entropy_coef,      # shows the anneal schedule
         # Performance
         "perf/episode_time_s":      episode_time,
         "cache/hit_rate":           ep_hit_rate,
@@ -534,7 +542,9 @@ def _log_training_step(
     if policy_loss is not None:
         log_dict["loss/policy"] = policy_loss.item()
     if episode_entropy is not None:
-        log_dict["agent/entropy"] = episode_entropy  # raw policy entropy, logged every episode
+        # Normalise per-episode entropy to [0,1] range using current config size
+        n_actions = n_parts_ep * (args.n_rotations if hasattr(args, "n_rotations") else 8)
+        log_dict["agent/entropy"] = episode_entropy / math.log(max(n_actions, 2))
     wandb.log(log_dict, step=episode + 1)
 
 _log_training_step._prev_misses  = 0
@@ -879,7 +889,7 @@ def train(args: argparse.Namespace) -> None:
         _log_training_step(episode, args, env, n_parts_ep, reward, loss, entropy_bonus,
                            imitation_loss, imitation_coef, stats, episode_time,
                            rot_entropy=rot_entropy, policy_loss=policy_loss,
-                           episode_entropy=episode_entropy)
+                           episode_entropy=episode_entropy, entropy_coef=entropy_coef)
 
         if (episode + 1) % args.eval_interval == 0:
             last_eval_density = _log_eval_set(
