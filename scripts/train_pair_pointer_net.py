@@ -835,6 +835,9 @@ def train(args: argparse.Namespace) -> None:
             mini_bs   = args.ppo_mini_batch if args.ppo_mini_batch > 0 else N_total
             nan_break = False
 
+            t_ppo = time.perf_counter()
+            print(f"  [ppo] updating on {N_total} steps × {args.ppo_epochs} epochs ...", end=" ", flush=True)
+
             for _ in range(args.ppo_epochs):
                 optimizer.zero_grad(set_to_none=True)
                 epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = epoch_policy = 0.0
@@ -879,6 +882,8 @@ def train(args: argparse.Namespace) -> None:
                 imitation_loss = torch.tensor(epoch_imit)
                 rot_entropy    = torch.tensor(epoch_rot_ent)
                 policy_loss    = torch.tensor(epoch_policy)
+
+            print(f"done ({time.perf_counter() - t_ppo:.1f}s)  loss={epoch_loss:.4f}", flush=True)
 
             batch_log_probs.clear()
             batch_entropies.clear()
