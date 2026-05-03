@@ -314,11 +314,15 @@ class UNestingGymEnv:
                     verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
                     part_canvas = _rasterize_polygon(verts_px, IMG)
 
-                    # Board+part SDF: zero-fill placement footprint into base_dist
-                    result_dist = base_dist.copy()
-                    result_dist[base_canvas | part_canvas] = 0.0
+                    # Board+part SDF: full EDT recompute with new part as obstacle.
+                    # Previously this zeroed out part pixels in base_dist (fast but wrong:
+                    # gradient around the new part was the old board's gradient, not a
+                    # proper distance field including the new obstacle).
+                    combined_dist = distance_transform_edt(
+                        ~(base_canvas | part_canvas)
+                    ).astype(np.float32)
                     result[ep, r_idx + 1] = (
-                        np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+                        np.clip(combined_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
                     )
 
                     # Isolated part SDF: center the (rotated) part on a blank canvas
