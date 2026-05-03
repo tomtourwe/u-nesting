@@ -203,12 +203,21 @@ def _build_env(args: argparse.Namespace) -> UNestingGymEnv:
             f"[warn] plate {args.plate_width:.0f}×{args.plate_height:.0f} mm is very small. "
             "Aligner parts are ~50 mm wide; use e.g. --plate-width 280 --plate-height 200."
         )
+    # Ensure place_remaining() uses the same rotation set as the agent.
+    # If --rotations is given explicitly, use that; otherwise derive from --n-rotations
+    # so greedy and agent are always consistent.
+    if args.rotations is not None:
+        rotations_deg = args.rotations
+    elif args.n_rotations > 0:
+        rotations_deg = [360.0 * r / args.n_rotations for r in range(args.n_rotations)]
+    else:
+        rotations_deg = None
     return UNestingGymEnv(
         args.json,
         plate_width=args.plate_width,
         plate_height=args.plate_height,
         sdf_clip_px=args.sdf_clip_px,
-        rotations=args.rotations,
+        rotations=rotations_deg,
         rollout_step_multiplier=args.rollout_step_multiplier,
     )
 
@@ -248,25 +257,51 @@ def _evaluate_actions(
     model: torch.nn.Module,
     observations: list[tuple],
     device: torch.device,
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
-    log_probs, entropies, rot_entropies, imitation_losses = [], [], [], []
-    for obs_entry in observations:
+    cached_embeddings: list[torch.Tensor] | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Re-evaluate stored observations under the current policy.
+
+    cached_embeddings: if provided, skip the CNN encode step and call model.score()
+                       directly. Must be a list of (N*R, 128) tensors, one per obs.
+                       On the first PPO epoch pass None; the returned embeddings can
+                       be passed to subsequent epochs to avoid re-running the CNN.
+
+    Returns: (log_probs, entropies, rot_entropies, imitation_losses, embeddings)
+        embeddings is a list of (N*R, 128) detached tensors (None entries for
+        legacy observations that don't use encode/score).
+    """
+    log_probs, entropies, rot_entropies, imitation_losses, embeddings = [], [], [], [], []
+    for i, obs_entry in enumerate(observations):
+        cached_emb = cached_embeddings[i] if cached_embeddings is not None else None
+
         if len(obs_entry) == 5 and obs_entry[3] is not None and obs_entry[4].dim() == 3:
-            # New flat joint format with scalars: (obs_t, mask, action_id, greedy_target, scalars_t)
+            # Flat joint format with scalars: (obs_t, mask, action_id, greedy_target, scalars_t)
             obs_t, mask, action_id, greedy_target, scalars_t = obs_entry
-            obs_t     = obs_t.to(device,      non_blocking=True)
             mask      = mask.to(device,       non_blocking=True)
             action_id = action_id.to(device,  non_blocking=True)
-            scalars_t = scalars_t.to(device,  non_blocking=True)
 
             with _autocast(device):
-                joint_logits = model(obs_t, mask, scalars_t)              # (N, R)
+                if cached_emb is not None:
+                    # Score-only path: CNN skipped, only Transformer+head runs
+                    N_obs = obs_t.shape[0]
+                    R_obs = (obs_t.shape[1] - 1) // 2
+                    joint_logits = model.score(
+                        cached_emb.to(device, non_blocking=True), mask, N_obs, R_obs)
+                    embeddings.append(None)
+                else:
+                    obs_t     = obs_t.to(device,      non_blocking=True)
+                    scalars_t = scalars_t.to(device,  non_blocking=True)
+                    fused        = model.encode(obs_t, scalars_t)
+                    N_obs, R_obs = obs_t.shape[0], (obs_t.shape[1] - 1) // 2
+                    joint_logits = model.score(fused, mask, N_obs, R_obs)
+                    embeddings.append(fused.detach().cpu())
+
             N, R = joint_logits.shape
             flat_dist = Categorical(logits=joint_logits.reshape(N * R))
             log_probs.append(flat_dist.log_prob(action_id))
             entropies.append(flat_dist.entropy())
-            # Imitation: marginalise over rotations via logsumexp → part logits
-            part_logits_imit = joint_logits.logsumexp(dim=1)              # (N,)
+            part_logits_imit = joint_logits.logsumexp(dim=1)
             imitation_losses.append(
                 F.cross_entropy(
                     part_logits_imit.unsqueeze(0),
@@ -276,17 +311,28 @@ def _evaluate_actions(
         elif len(obs_entry) == 4:
             # Old flat joint format without scalars: (obs_t, mask, action_id, greedy_target)
             obs_t, mask, action_id, greedy_target = obs_entry
-            obs_t     = obs_t.to(device,     non_blocking=True)
             mask      = mask.to(device,      non_blocking=True)
             action_id = action_id.to(device, non_blocking=True)
 
             with _autocast(device):
-                joint_logits = model(obs_t, mask)                          # (N, R)
+                if cached_emb is not None:
+                    N_obs = obs_t.shape[0]
+                    R_obs = (obs_t.shape[1] - 1) // 2
+                    joint_logits = model.score(
+                        cached_emb.to(device, non_blocking=True), mask, N_obs, R_obs)
+                    embeddings.append(None)
+                else:
+                    obs_t        = obs_t.to(device, non_blocking=True)
+                    fused        = model.encode(obs_t)
+                    N_obs, R_obs = obs_t.shape[0], (obs_t.shape[1] - 1) // 2
+                    joint_logits = model.score(fused, mask, N_obs, R_obs)
+                    embeddings.append(fused.detach().cpu())
+
             N, R = joint_logits.shape
             flat_dist = Categorical(logits=joint_logits.reshape(N * R))
             log_probs.append(flat_dist.log_prob(action_id))
             entropies.append(flat_dist.entropy())
-            part_logits_imit = joint_logits.logsumexp(dim=1)              # (N,)
+            part_logits_imit = joint_logits.logsumexp(dim=1)
             imitation_losses.append(
                 F.cross_entropy(
                     part_logits_imit.unsqueeze(0),
@@ -307,6 +353,7 @@ def _evaluate_actions(
             part_dist = Categorical(logits=part_logits)
             log_probs.append(part_dist.log_prob(part_id))
             entropies.append(part_dist.entropy())
+            embeddings.append(None)
             imitation_losses.append(
                 F.cross_entropy(
                     part_logits.unsqueeze(0),
@@ -314,7 +361,7 @@ def _evaluate_actions(
                 )
             )
 
-    return log_probs, entropies, rot_entropies, imitation_losses
+    return log_probs, entropies, rot_entropies, imitation_losses, embeddings
 
 
 def _ppo_loss(
@@ -851,17 +898,24 @@ def train(args: argparse.Namespace) -> None:
             t_ppo = time.perf_counter()
             print(f"  [ppo] updating on {N_total} steps × {args.ppo_epochs} epochs ...", end=" ", flush=True)
 
-            for _ in range(args.ppo_epochs):
+            # Embedding cache: epoch 0 runs CNN (encode) and caches embeddings.
+            # Subsequent epochs call score() only — CNN is not re-run.
+            emb_cache: list[torch.Tensor] | None = None
+
+            for epoch_idx in range(args.ppo_epochs):
                 optimizer.zero_grad(set_to_none=True)
                 epoch_loss = epoch_ent = epoch_imit = epoch_rot_ent = epoch_policy = 0.0
+                new_emb_cache: list[torch.Tensor] = []
 
                 for start in range(0, N_total, mini_bs):
-                    chunk_obs = batch_observations[start : start + mini_bs]
-                    chunk_old = old_log_probs[start : start + mini_bs]
-                    chunk_adv = norm_adv[start : start + mini_bs]
+                    chunk_obs  = batch_observations[start : start + mini_bs]
+                    chunk_old  = old_log_probs[start : start + mini_bs]
+                    chunk_adv  = norm_adv[start : start + mini_bs]
+                    chunk_embs = emb_cache[start : start + mini_bs] if emb_cache is not None else None
 
-                    new_lp, new_ent, _new_rot_ent, new_imit = _evaluate_actions(
-                        model, chunk_obs, device)
+                    new_lp, new_ent, _new_rot_ent, new_imit, chunk_new_embs = _evaluate_actions(
+                        model, chunk_obs, device, cached_embeddings=chunk_embs)
+                    new_emb_cache.extend(chunk_new_embs)
 
                     n_actions = (n_parts_ep * args.n_rotations
                                  if rotations_rad is not None else n_parts_ep)
@@ -895,6 +949,10 @@ def train(args: argparse.Namespace) -> None:
                 imitation_loss = torch.tensor(epoch_imit)
                 rot_entropy    = torch.tensor(epoch_rot_ent)
                 policy_loss    = torch.tensor(epoch_policy)
+
+                # After epoch 0: populate cache so subsequent epochs skip CNN
+                if emb_cache is None and any(e is not None for e in new_emb_cache):
+                    emb_cache = new_emb_cache
 
             print(f"done ({time.perf_counter() - t_ppo:.1f}s)  loss={epoch_loss:.4f}", flush=True)
 

@@ -100,20 +100,12 @@ def run_board2d(geometries: list[dict], strategy: str, boundary: dict,
                 "rollout_step_multiplier": rollout_multiplier},
     )
 
-    snapshots = []
-
+    # In greedy mode sort largest-first (mirrors Rust place_remaining order),
+    # then place one-by-one to capture per-step snapshots.
     if greedy:
-        n_placed = board.place_remaining()
-        util = board.packing_density()
-        placed_polys = list(board.placed_polygons())
-        placements = list(board.placements())
-        print(f"\nGreedy result  (rollout_multiplier={rollout_multiplier})")
-        print(f"  Parts submitted : {len(geometries)}")
-        print(f"  Placed          : {n_placed}")
-        print(f"  Density         : {util:.1%}")
-        snapshots.append((placed_polys, placements, util, f"greedy\n{n_placed} placed  {util:.0%}"))
-        return snapshots, placed_polys, placements, util
+        geometries = sorted(geometries, key=lambda g: polygon_area(g["polygon"]), reverse=True)
 
+    snapshots = []
     placed = 0
     failed = []
     for i, g in enumerate(geometries):
@@ -123,7 +115,8 @@ def run_board2d(geometries: list[dict], strategy: str, boundary: dict,
             util_now = board.packing_density()
             pos = result["position"]
             rot = math.degrees(result["rotation"])
-            print(f"  [{i+1:3d}/{len(geometries)}] placed {g['id']:8s}  pos=({pos[0]:7.1f}, {pos[1]:7.1f})  rot={rot:5.1f}°  density={util_now:.1%}")
+            mode = "greedy" if greedy else "fine"
+            print(f"  [{i+1:3d}/{len(geometries)}] placed {g['id']:8s}  pos=({pos[0]:7.1f}, {pos[1]:7.1f})  rot={rot:5.1f}°  density={util_now:.1%}  [{mode}]")
             snapshots.append((
                 list(board.placed_polygons()),
                 list(board.placements()),
@@ -135,10 +128,10 @@ def run_board2d(geometries: list[dict], strategy: str, boundary: dict,
             print(f"  [{i+1:3d}/{len(geometries)}] FAILED {g['id']}")
 
     util = board.packing_density()
-    print(f"\nResult")
+    print(f"\nResult  ({'greedy' if greedy else 'fine'}, multiplier={rollout_multiplier})")
     print(f"  Parts submitted : {len(geometries)}")
     print(f"  Placed          : {placed}")
-    print(f"  Failed to place : {len(failed)}  {failed}")
+    print(f"  Failed          : {len(failed)}  {failed}")
     print(f"  Density         : {util:.1%}")
 
     return snapshots, board.placed_polygons(), board.placements(), util
@@ -198,11 +191,8 @@ def plot_steps(
     plt.suptitle(f"Nesting steps — {len(final_placements)} placed, {boundary['width']:.0f}×{boundary['height']:.0f} mm", fontsize=10)
     plt.tight_layout()
 
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-        print(f"  Plot saved to {save_path}")
-    else:
-        plt.show()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    print(f"  Plot saved to {save_path}")
 
 
 def main():
@@ -218,8 +208,7 @@ def main():
     parser.add_argument("--sort", action="store_true", help="Largest-area-first ordering")
     parser.add_argument("--greedy", action="store_true", help="Use place_remaining() — same coarse greedy as training eval")
     parser.add_argument("--rollout-multiplier", type=float, default=3.0, help="Sample step multiplier for greedy (default 3.0, same as training)")
-    parser.add_argument("--no-plot", action="store_true")
-    parser.add_argument("--plot-out", type=Path, default=None, help="Save PNG instead of showing")
+    parser.add_argument("--plot-out", type=Path, default=Path("nest_result.png"), help="Output PNG path (default: nest_result.png)")
     args = parser.parse_args()
 
     boundary = {"width": args.plate_width, "height": args.plate_height}
@@ -238,8 +227,7 @@ def main():
         greedy=args.greedy,
     )
 
-    if not args.no_plot:
-        plot_steps(snapshots, placed_polys, placements, boundary, save_path=args.plot_out)
+    plot_steps(snapshots, placed_polys, placements, boundary, save_path=args.plot_out)
 
 
 if __name__ == "__main__":

@@ -226,6 +226,56 @@ class SplitPointerNet(nn.Module):
         self.part_ctx    = PartTransformer()
         self.joint_head  = nn.Linear(128, 1)
 
+    def encode(
+        self,
+        obs:     torch.Tensor,            # (N, 2R+1, 128, 128)
+        scalars: torch.Tensor | None = None,  # (N, R, 3)
+    ) -> torch.Tensor:
+        """
+        CNN encode step: obs → fused embeddings (N*R, 128).
+
+        Expensive (CNN forward pass). Call once per rollout step; cache the result
+        and pass to score() for PPO re-evaluation without re-running the CNN.
+        """
+        N, two_Rp1, H, W = obs.shape
+        R = (two_Rp1 - 1) // 2
+
+        board         = obs[0, 0].unsqueeze(0).unsqueeze(0)
+        current_flat  = obs[:, 0].unsqueeze(1).expand(N, R, H, W).reshape(N * R, 1, H, W)
+        after_flat    = obs[:, 1:R + 1].reshape(N * R, 1, H, W)
+        isolated_flat = obs[:, R + 1:2 * R + 1].reshape(N * R, 1, H, W)
+        part_in       = torch.cat([after_flat - current_flat, after_flat, isolated_flat], dim=1)
+
+        board_feat = self.board_cnn(board)                             # (1, 128)
+        rot_feats  = self.part_cnn(part_in).reshape(N, R, 128)        # (N, R, 128)
+
+        board_exp = board_feat.expand(N * R, -1)
+        fused     = self.fusion(torch.cat([board_exp, rot_feats.reshape(N * R, 128)], dim=-1))
+
+        if scalars is not None:
+            fused = fused + self.scalar_proj(scalars.reshape(N * R, 3))
+
+        return fused                                                    # (N*R, 128)
+
+    def score(
+        self,
+        fused: torch.Tensor,   # (N*R, 128)
+        mask:  torch.Tensor,   # (N,)
+        N:     int,
+        R:     int,
+    ) -> torch.Tensor:
+        """
+        Transformer score step: fused embeddings → (N, R) logits.
+
+        Cheap. Call this during PPO re-evaluation epochs after the first, passing
+        the cached embedding from encode() so the CNN is not re-run.
+        """
+        mask_flat    = mask.unsqueeze(1).expand(N, R).reshape(N * R)
+        ctx          = self.part_ctx(fused, mask_flat)                 # (N*R, 128)
+        joint_logits = self.joint_head(ctx).reshape(N, R)             # (N, R)
+        mask_exp     = mask.unsqueeze(1).expand(N, R)
+        return joint_logits.masked_fill(mask_exp == 0, -1e9)           # (N, R)
+
     def forward(
         self,
         obs:     torch.Tensor,            # (N, 2R+1, 128, 128)
@@ -234,47 +284,13 @@ class SplitPointerNet(nn.Module):
     ) -> torch.Tensor:
         """
         Score all N×R (part, rotation) pairs jointly.
-
-        scalars: per-(part,rotation) features [area_frac, bbox_w, bbox_h] z-scored
-                 across N parts. Injected additively after fusion so the network
-                 can directly compare relative sizes. Pass None to skip (legacy).
-
-        Returns:
-            joint_logits : (N, R)   placed parts have all R logits set to −1e9
+        Equivalent to encode() followed by score(). Use directly during rollout.
+        During PPO, prefer encode() + score() to cache the embedding across epochs.
         """
         N, two_Rp1, H, W = obs.shape
         R = (two_Rp1 - 1) // 2
-
-        board         = obs[0, 0].unsqueeze(0).unsqueeze(0)            # (1, 1, H, W)
-        current_flat  = obs[:, 0].unsqueeze(1).expand(N, R, H, W)\
-                            .reshape(N * R, 1, H, W)                   # (N*R, 1, H, W)
-        after_flat    = obs[:, 1:R + 1].reshape(N * R, 1, H, W)       # (N*R, 1, H, W)
-        isolated_flat = obs[:, R + 1:2 * R + 1].reshape(N * R, 1, H, W)  # (N*R, 1, H, W)
-        part_in       = torch.cat([after_flat - current_flat,
-                                   after_flat,
-                                   isolated_flat], dim=1)              # (N*R, 3, H, W)
-
-        board_feat = self.board_cnn(board)                             # (1, 128)
-        rot_feats  = self.part_cnn(part_in).reshape(N, R, 128)        # (N, R, 128)
-
-        # Fuse board context into every (part, rotation) token
-        board_exp = board_feat.expand(N * R, -1)                       # (N*R, 128)
-        fused     = self.fusion(torch.cat([
-            board_exp, rot_feats.reshape(N * R, 128),
-        ], dim=-1))                                                     # (N*R, 128)
-
-        # Inject scalar geometry features (area, bbox w/h) as additive residual
-        if scalars is not None:
-            fused = fused + self.scalar_proj(scalars.reshape(N * R, 3))  # (N*R, 128)
-
-        # Transformer attends over all N×R tokens jointly
-        mask_flat    = mask.unsqueeze(1).expand(N, R).reshape(N * R)  # (N*R,)
-        ctx          = self.part_ctx(fused, mask_flat)                 # (N*R, 128)
-        joint_logits = self.joint_head(ctx).reshape(N, R)             # (N, R)
-
-        # Mask placed parts: all R logits → -1e9
-        mask_exp = mask.unsqueeze(1).expand(N, R)                      # (N, R)
-        return joint_logits.masked_fill(mask_exp == 0, -1e9)           # (N, R)
+        fused = self.encode(obs, scalars)
+        return self.score(fused, mask, N, R)
 
 
 # ---------------------------------------------------------------------------
