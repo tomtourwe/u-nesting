@@ -209,6 +209,7 @@ def _build_env(args: argparse.Namespace) -> UNestingGymEnv:
         plate_height=args.plate_height,
         sdf_clip_px=args.sdf_clip_px,
         rotations=args.rotations,
+        rollout_step_multiplier=args.rollout_step_multiplier,
     )
 
 
@@ -514,10 +515,14 @@ def _log_training_step(
     _log_training_step._prev_misses = misses
     _log_training_step._prev_hits   = hits
 
-    # entropy_bonus here is the RAW normalised entropy [0,1] (not coef×entropy).
-    # Log both the raw value and the weighted loss contribution separately.
-    entropy_norm     = entropy_bonus.item()          # normalised entropy in [0,1]
-    entropy_weighted = entropy_coef * entropy_norm   # actual loss contribution
+    # Use episode_entropy (from rollout) for the continuous per-episode norm plot.
+    # entropy_bonus is only non-zero on PPO-firing episodes; episode_entropy is always available.
+    n_actions = n_parts_ep * (args.n_rotations if hasattr(args, "n_rotations") else 8)
+    if episode_entropy is not None:
+        entropy_norm = episode_entropy / math.log(max(n_actions, 2))
+    else:
+        entropy_norm = entropy_bonus.item()   # fallback: PPO-step value
+    entropy_weighted = entropy_coef * entropy_norm
 
     log_dict = {
         # Agent nesting quality
@@ -541,10 +546,7 @@ def _log_training_step(
         log_dict["loss/rot_entropy"] = rot_entropy.item()
     if policy_loss is not None:
         log_dict["loss/policy"] = policy_loss.item()
-    if episode_entropy is not None:
-        # Normalise per-episode entropy to [0,1] range using current config size
-        n_actions = n_parts_ep * (args.n_rotations if hasattr(args, "n_rotations") else 8)
-        log_dict["agent/entropy"] = episode_entropy / math.log(max(n_actions, 2))
+    log_dict["agent/entropy"] = entropy_norm   # same as loss/entropy_norm, kept for compat
     wandb.log(log_dict, step=episode + 1)
 
 _log_training_step._prev_misses  = 0
@@ -959,16 +961,18 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--fixed-parts",         action="store_true")
     p.add_argument("--eval-seed",           type=int,   default=7)
     p.add_argument("--sdf-clip-px",         type=int,   default=8)
+    p.add_argument("--rollout-step-multiplier", type=float, default=1.0,
+                   help="Sample step multiplier for greedy eval baseline (default 1.0 = fine grid).")
     p.add_argument("--n-parts-start",       type=int,   default=None)
     p.add_argument("--curriculum-episodes", type=int,   default=None)
     p.add_argument("--n-eval-configs",      type=int,   default=20)
     p.add_argument("--ppo-clip",             type=float, default=0.2)
     p.add_argument("--ppo-epochs",          type=int,   default=4)
-    p.add_argument("--rollouts-per-config", type=int,   default=8,
+    p.add_argument("--rollouts-per-config", type=int,   default=1,
                    help="Run this many rollouts on the same parts config before sampling a new one (default 8). "
                         "Within-group advantage normalization removes config-difficulty variance, "
                         "leaving only policy-quality signal.")
-    p.add_argument("--configs-per-update",   type=int,   default=2,
+    p.add_argument("--configs-per-update",   type=int,   default=1,
                    help="Accumulate this many configs before running a PPO update (default 2). "
                         "Larger values give more diverse batches (different part combos) "
                         "at the cost of less frequent updates.")

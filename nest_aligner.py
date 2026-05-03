@@ -80,31 +80,50 @@ def polygon_area(vertices: list) -> float:
     return abs(area) / 2.0
 
 
-def run_board2d(geometries: list[dict], strategy: str, boundary: dict) -> tuple:
+def run_board2d(geometries: list[dict], strategy: str, boundary: dict,
+                rollout_multiplier: float = 1.0, greedy: bool = False) -> tuple:
     """
     Incremental greedy placement via Board2D (same API as the RL training loop).
-    Returns (placed_polygons, placements, utilization).
+
+    If greedy=True, uses place_remaining() — the same coarse greedy used during
+    training eval — with rollout_multiplier controlling the sample step.
+    If greedy=False, places parts one-by-one with the fine grid (committed quality).
+
+    Returns (snapshots, placed_polygons, placements, utilization).
     """
     from u_nesting import Board2D
 
     board = Board2D(
         boundary=boundary,
         geometries=geometries,
-        config={"strategy": strategy, "spacing": 0.0},
+        config={"strategy": strategy, "spacing": 0.0,
+                "rollout_step_multiplier": rollout_multiplier},
     )
+
+    snapshots = []
+
+    if greedy:
+        n_placed = board.place_remaining()
+        util = board.packing_density()
+        placed_polys = list(board.placed_polygons())
+        placements = list(board.placements())
+        print(f"\nGreedy result  (rollout_multiplier={rollout_multiplier})")
+        print(f"  Parts submitted : {len(geometries)}")
+        print(f"  Placed          : {n_placed}")
+        print(f"  Density         : {util:.1%}")
+        snapshots.append((placed_polys, placements, util, f"greedy\n{n_placed} placed  {util:.0%}"))
+        return snapshots, placed_polys, placements, util
 
     placed = 0
     failed = []
-    snapshots = []  # list of (placed_polygons, placements, util, label) after each step
-
     for i, g in enumerate(geometries):
         result = board.place(g["id"])
         if result is not None:
             placed += 1
-            util_now = board.utilization()
+            util_now = board.packing_density()
             pos = result["position"]
             rot = math.degrees(result["rotation"])
-            print(f"  [{i+1:3d}/{len(geometries)}] placed {g['id']:8s}  pos=({pos[0]:7.1f}, {pos[1]:7.1f})  rot={rot:5.1f}°  util={util_now:.1%}")
+            print(f"  [{i+1:3d}/{len(geometries)}] placed {g['id']:8s}  pos=({pos[0]:7.1f}, {pos[1]:7.1f})  rot={rot:5.1f}°  density={util_now:.1%}")
             snapshots.append((
                 list(board.placed_polygons()),
                 list(board.placements()),
@@ -115,12 +134,12 @@ def run_board2d(geometries: list[dict], strategy: str, boundary: dict) -> tuple:
             failed.append(g["id"])
             print(f"  [{i+1:3d}/{len(geometries)}] FAILED {g['id']}")
 
-    util = board.utilization()
+    util = board.packing_density()
     print(f"\nResult")
     print(f"  Parts submitted : {len(geometries)}")
     print(f"  Placed          : {placed}")
     print(f"  Failed to place : {len(failed)}  {failed}")
-    print(f"  Utilization     : {util:.1%}")
+    print(f"  Density         : {util:.1%}")
 
     return snapshots, board.placed_polygons(), board.placements(), util
 
@@ -197,6 +216,8 @@ def main():
     parser.add_argument("--rotations", type=float, nargs="+", default=None,
                         help="Override rotations in degrees, e.g. --rotations 0 90 180 270")
     parser.add_argument("--sort", action="store_true", help="Largest-area-first ordering")
+    parser.add_argument("--greedy", action="store_true", help="Use place_remaining() — same coarse greedy as training eval")
+    parser.add_argument("--rollout-multiplier", type=float, default=3.0, help="Sample step multiplier for greedy (default 3.0, same as training)")
     parser.add_argument("--no-plot", action="store_true")
     parser.add_argument("--plot-out", type=Path, default=None, help="Save PNG instead of showing")
     args = parser.parse_args()
@@ -211,7 +232,11 @@ def main():
         geometries.sort(key=lambda g: polygon_area(g["polygon"]), reverse=True)
         print(f"  Sorted largest-first (areas {polygon_area(geometries[0]['polygon']):.0f} → {polygon_area(geometries[-1]['polygon']):.0f} mm²)")
 
-    snapshots, placed_polys, placements, _ = run_board2d(geometries, args.strategy, boundary)
+    snapshots, placed_polys, placements, _ = run_board2d(
+        geometries, args.strategy, boundary,
+        rollout_multiplier=args.rollout_multiplier,
+        greedy=args.greedy,
+    )
 
     if not args.no_plot:
         plot_steps(snapshots, placed_polys, placements, boundary, save_path=args.plot_out)

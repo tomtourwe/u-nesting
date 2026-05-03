@@ -112,6 +112,7 @@ class UNestingGymEnv:
         sdf_clip_px: int = 8,   # kept for API compat, no longer used
         config: dict | None = None,
         rotations: list[float] | None = None,
+        rollout_step_multiplier: float = 1.0,
     ):
         with open(json_path) as f:
             raw = json.load(f)
@@ -167,10 +168,12 @@ class UNestingGymEnv:
             if rotations is not None
             else self._library
         )
+        board_config = dict(self._config) if self._config else {}
+        board_config.setdefault("rollout_step_multiplier", rollout_step_multiplier)
         self._board = _RustBoard2D(
             boundary=self._boundary,
             geometries=full_geoms,
-            config=self._config,
+            config=board_config,
         )
 
         # Set per episode
