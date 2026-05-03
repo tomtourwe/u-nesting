@@ -109,7 +109,7 @@ class UNestingGymEnv:
         json_path: str,
         plate_width: float,
         plate_height: float,
-        sdf_clip_px: int = 8,
+        sdf_clip_px: int = 8,   # kept for API compat, no longer used
         config: dict | None = None,
         rotations: list[float] | None = None,
     ):
@@ -140,13 +140,22 @@ class UNestingGymEnv:
         # library specifies; an explicit list overrides all library rotations.
         self._rotations = rotations
 
-        self.plate_w      = plate_width
-        self.plate_h      = plate_height
-        self._sdf_clip_px = sdf_clip_px
-        self._config      = config
+        self.plate_w  = plate_width
+        self.plate_h  = plate_height
+        self._config  = config
 
         self._sx = self.IMG_SIZE / plate_width
         self._sy = self.IMG_SIZE / plate_height
+
+        # Log-SDF normalization: log(1 + dist) / log(1 + max_dist).
+        # max_dist = half-diagonal of the image in pixels — the furthest any
+        # pixel can be from an obstacle on an empty board.
+        # This preserves the distinction between tight pockets and wide open
+        # space that a hard clip (e.g. clip=8px) would collapse to the same value.
+        import math as _math
+        self._sdf_log_scale = _math.log1p(
+            _math.sqrt(self.IMG_SIZE ** 2 + self.IMG_SIZE ** 2) / 2.0
+        )
 
         self._boundary = {"width": plate_width, "height": plate_height}
 
@@ -166,6 +175,18 @@ class UNestingGymEnv:
 
         # Set per episode
         self.current_lib_ids: list[int] = []
+
+    def _log_sdf(self, dist: np.ndarray) -> np.ndarray:
+        """Normalize a distance array to [0, 1] using log scale.
+
+        log(1 + dist) / log(1 + max_dist)
+
+        Preserves ordering across the full range: a 2px pocket interior and
+        an 80px open space both map to distinct values, unlike a hard clip
+        where both would saturate to 1.0.
+        """
+        import math as _math
+        return (np.log1p(dist) / self._sdf_log_scale).clip(0.0, 1.0).astype(np.float32)
 
     # ------------------------------------------------------------------
     # Episode management
@@ -281,7 +302,7 @@ class UNestingGymEnv:
             base_canvas |= _rasterize_polygon(verts_px, IMG)
 
         base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+        current_sdf = self._log_sdf(base_dist)
 
         # ── batch Rust preview for remaining parts × all rotations ─────────
         remaining_set = set(remaining_eps)
@@ -322,7 +343,7 @@ class UNestingGymEnv:
                         ~(base_canvas | part_canvas)
                     ).astype(np.float32)
                     result[ep, r_idx + 1] = (
-                        np.clip(combined_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+                        self._log_sdf(combined_dist)
                     )
 
                     # Isolated part SDF: center the (rotated) part on a blank canvas
@@ -334,7 +355,7 @@ class UNestingGymEnv:
                     part_only = _rasterize_polygon(centered, IMG)
                     part_dist_arr = distance_transform_edt(~part_only).astype(np.float32)
                     result[ep, R + 1 + r_idx] = (
-                        np.clip(part_dist_arr, 0, self._sdf_clip_px) / self._sdf_clip_px
+                        self._log_sdf(part_dist_arr)
                     )
 
                     # Scalar features: area, bbox width, bbox height (all in [0,1])
@@ -381,7 +402,7 @@ class UNestingGymEnv:
             base_canvas |= _rasterize_polygon(verts_px, IMG)
 
         base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+        current_sdf = self._log_sdf(base_dist)
 
         raw = self._board.preview_all_per_rotation([geom_id] * R, rotations_rad)
 
@@ -393,9 +414,8 @@ class UNestingGymEnv:
             else:
                 verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
                 part_canvas = _rasterize_polygon(verts_px, IMG)
-                result_dist = base_dist.copy()
-                result_dist[base_canvas | part_canvas] = 0.0
-                result[r_idx + 1] = np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+                combined    = distance_transform_edt(~(base_canvas | part_canvas)).astype(np.float32)
+                result[r_idx + 1] = self._log_sdf(combined)
 
         return result
 
@@ -495,7 +515,7 @@ class UNestingGymEnv:
 
         # --- current board SDF (channel 0) ---
         base_dist   = distance_transform_edt(~base_canvas).astype(np.float32)
-        current_sdf = np.clip(base_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+        current_sdf = self._log_sdf(base_dist)
 
         # --- result tensor: default both channels to current SDF ---
         result = np.empty((N, 2, self.IMG_SIZE, self.IMG_SIZE), dtype=np.float32)
@@ -509,13 +529,8 @@ class UNestingGymEnv:
                 continue
             verts_px    = [(x * self._sx, y * self._sy) for x, y in verts_board]
             part_canvas = _rasterize_polygon(verts_px, self.IMG_SIZE)
-            # Same fast approximation as preview_images_per_rotation: copy base_dist
-            # and zero-fill the placement footprint. Avoids a per-part EDT call
-            # (the per-part EDT was the eval bottleneck and also inconsistent with
-            # how training observations are computed).
-            result_dist = base_dist.copy()
-            result_dist[base_canvas | part_canvas] = 0.0
-            result[ep_id, 1] = np.clip(result_dist, 0, self._sdf_clip_px) / self._sdf_clip_px
+            combined = distance_transform_edt(~(base_canvas | part_canvas)).astype(np.float32)
+            result[ep_id, 1] = self._log_sdf(combined)
 
         return result
 
