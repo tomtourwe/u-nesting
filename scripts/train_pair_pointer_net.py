@@ -754,6 +754,7 @@ def train(args: argparse.Namespace) -> None:
 
     # Same-config multi-rollout tracking (best-of-K selection)
     config_rollout_idx: int  = 0
+    configs_since_update: int = 0
     current_lib_ids:    list[int] | None = None
     n_parts_ep:         int  = 0
     # Buffer for K rollouts of the same config; each entry is
@@ -812,8 +813,18 @@ def train(args: argparse.Namespace) -> None:
             print(f"  → config: best={best[0]:.4f}({best[5]}p)  worst={worst[0]:.4f}({worst[5]}p)  spread={spread:.4f}")
             cfg_rollouts.clear()
             config_rollout_idx = 0
+            configs_since_update += 1
 
-            # PPO update on every config flush
+            if configs_since_update < args.configs_per_update:
+                # Accumulate more configs before updating
+                entropy_coef   = _current_entropy_coef(episode, args)
+                imitation_coef = _current_imitation_coef(episode, args)
+                loss = entropy_bonus = imitation_loss = rot_entropy = policy_loss = torch.tensor(0.0)
+                continue
+
+            configs_since_update = 0
+
+            # PPO update after accumulating configs_per_update configs
             entropy_coef   = _current_entropy_coef(episode, args)
             imitation_coef = _current_imitation_coef(episode, args)
 
@@ -957,6 +968,10 @@ def _parse() -> argparse.Namespace:
                    help="Run this many rollouts on the same parts config before sampling a new one (default 8). "
                         "Within-group advantage normalization removes config-difficulty variance, "
                         "leaving only policy-quality signal.")
+    p.add_argument("--configs-per-update",   type=int,   default=2,
+                   help="Accumulate this many configs before running a PPO update (default 2). "
+                        "Larger values give more diverse batches (different part combos) "
+                        "at the cost of less frequent updates.")
     p.add_argument("--contrast-k",          type=int,   default=1,
                    help="Use top-K and bottom-K rollouts for the PPO update (default 1 = best+worst only). "
                         "Increasing to 2 uses top-2 and bottom-2, giving more gradient data while "
